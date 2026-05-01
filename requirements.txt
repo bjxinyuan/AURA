@@ -228,3 +228,6 @@ xgrammar==0.1.29
 xxhash==3.6.0
 yarl==1.23.0
 zipp==3.23.0
+
+# --- test-only (not needed at runtime) ---
+pytest>=8.0
