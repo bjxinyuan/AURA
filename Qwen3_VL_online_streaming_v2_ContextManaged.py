@@ -67,6 +67,13 @@ from context_manage import remove_markdown
 # Extracted modules (see aura/)
 from aura.session_history import SessionHistory, SILENT_TEXT
 from aura.cross_turn_penalty import CrossTurnPenalty
+from aura.session import StreamingSession
+from aura.server_io import (
+    send_streaming_token,
+    send_asr_query,
+    send_audio,
+    send_audio_chunk,
+)
 
 # Global configuration
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -122,25 +129,11 @@ def setup_silent_token_id(model_path: str):
 # CrossTurnPenalty has moved to aura/cross_turn_penalty.py (see arch.md §5.3).
 
 
-@dataclass
-class StreamingSession:
-    """A streaming session for client."""
-    session_id: str
-    history: SessionHistory
-    input_queue: asyncio.Queue
-    output_queue: asyncio.Queue
-    is_generating: bool = False
-    is_auto_generating: bool = False
-    current_task: Optional[asyncio.Task] = None
-    cross_turn_penalty: Optional[CrossTurnPenalty] = None
+# StreamingSession moved to aura/session.py
 
 # ============================================================================
 # Global State
 # ============================================================================
-
-# Server state
-active_connection = None
-connection_lock = threading.Lock()
 
 # TTS related globals (TTS model is now a remote service)
 tts_enabled = False
@@ -548,7 +541,7 @@ def get_pending_tts_task() -> dict:
 SENTENCE_TERMINATORS = "。！？；.!?;，,"
 SENTENCE_TERMINATORS_SET = set(SENTENCE_TERMINATORS)
 
-def enqueue_tts_sentence(sentence: str, response_id: str, sentence_idx: int, args):
+def enqueue_tts_sentence(sentence: str, session, response_id: str, sentence_idx: int, args):
     """
     Add a sentence to the TTS queue for processing.
     This enables pipeline parallelism: model generates next sentence while TTS processes current.
@@ -561,6 +554,7 @@ def enqueue_tts_sentence(sentence: str, response_id: str, sentence_idx: int, arg
         return
 
     task = {
+        "session": session,
         "response_id": response_id,
         "sentence_idx": sentence_idx,
         "text": clean_text,
@@ -750,6 +744,9 @@ def tts_worker_loop(args):
             sentence_start = _time.time()
             first_chunk_sent = False
 
+            session = task.get("session")
+            if session is None:
+                continue  # tasks enqueued without a session (shouldn't happen post-refactor)
             response_id = task.get("response_id", "")
             sentence_idx = task.get("sentence_idx", 0)
             text = task.get("text", "")
@@ -785,7 +782,8 @@ def tts_worker_loop(args):
                     total_samples += len(audio_bytes) // 2  # int16 = 2 bytes per sample
 
                     # Send chunk immediately (not collecting!)
-                    send_audio_chunk_to_client(
+                    send_audio_chunk(
+                        session,
                         pcm_bytes=audio_bytes,
                         response_id=response_id,
                         sentence_idx=sentence_idx,
@@ -821,7 +819,8 @@ def tts_worker_loop(args):
 
                     # Send final marker only if not cancelled
                     if not should_cancel_tts():
-                        send_audio_chunk_to_client(
+                        send_audio_chunk(
+                            session,
                             pcm_bytes=b'',  # Empty data for final marker
                             response_id=response_id,
                             sentence_idx=sentence_idx,
@@ -882,7 +881,7 @@ def tts_worker_loop(args):
 
                         # Send complete WAV
                         estimated_total = sentence_idx + 1
-                        send_audio_to_client(wav_bytes, response_id, sentence_idx, estimated_total)
+                        send_audio(session, wav_bytes, response_id, sentence_idx, estimated_total)
                         print(f"🔊 [TTS] Sent sentence {sentence_idx} ({audio_duration:.1f}s WAV in {sentence_time:.2f}s)")
                     else:
                         print(f"⏹ [TTS] Sentence {sentence_idx} cancelled after {len(audio_parts)} chunks")
@@ -1108,10 +1107,10 @@ async def generate_response_with_video(
 
                         # --- Stream delta to frontend ---
                         if not streaming_started:
-                            send_streaming_token_to_client(delta, request_id, is_start=True)
+                            send_streaming_token(session, delta, request_id, is_start=True)
                             streaming_started = True
                         else:
-                            send_streaming_token_to_client(delta, request_id)
+                            send_streaming_token(session, delta, request_id)
 
                         # --- Incremental TTS sentence detection ---
                         if tts_enabled_for_this_response:
@@ -1130,7 +1129,7 @@ async def generate_response_with_video(
                                 sentence = _tts_sentence_buf[:split_pos]
                                 _tts_sentence_buf = _tts_sentence_buf[split_pos:]
                                 if sentence.strip():
-                                    enqueue_tts_sentence(sentence, request_id, _tts_sentence_idx, args)
+                                    enqueue_tts_sentence(sentence, session, request_id, _tts_sentence_idx, args)
                                     _tts_sentence_idx += 1
 
         # ===== Generation finished — decide: silent / send =====
@@ -1154,20 +1153,20 @@ async def generate_response_with_video(
         if is_silent_response:
             print(f"🔇 [DECISION] → MODEL_SILENT (first token was silent/im_end)")
             session.history.add_assistant_message(SILENT_TEXT)
-            send_streaming_token_to_client(SILENT_TEXT, request_id, is_final=True, is_silent=True)
+            send_streaming_token(session, SILENT_TEXT, request_id, is_final=True, is_silent=True)
             if session.cross_turn_penalty is not None:
                 session.cross_turn_penalty.record(None)
 
         else:
             # Send final marker to frontend (content already streamed)
-            send_streaming_token_to_client("", request_id, is_final=True)
+            send_streaming_token(session, "", request_id, is_final=True)
             session.history.add_assistant_message(full_response)
             if session.cross_turn_penalty is not None:
                 session.cross_turn_penalty.record(full_response)
 
             # Flush remaining TTS sentence buffer
             if tts_enabled_for_this_response and _tts_sentence_buf.strip():
-                enqueue_tts_sentence(_tts_sentence_buf, request_id, _tts_sentence_idx, args)
+                enqueue_tts_sentence(_tts_sentence_buf, session, request_id, _tts_sentence_idx, args)
                 _tts_sentence_idx += 1
 
             if tts_enabled_for_this_response:
@@ -1176,13 +1175,13 @@ async def generate_response_with_video(
     except asyncio.CancelledError:
         print(f"⏹ [Session {session.session_id}] Generation cancelled (context reset)")
         if streaming_started and request_id:
-            send_streaming_token_to_client("", request_id, is_final=True)
+            send_streaming_token(session, "", request_id, is_final=True)
     except Exception as e:
         print(f"❌ [Session {session.session_id}] Generation error: {e}")
         import traceback
         traceback.print_exc()
         if request_id:
-            send_streaming_token_to_client("", request_id, is_final=True)
+            send_streaming_token(session, "", request_id, is_final=True)
     finally:
         # CRITICAL: Always reset the generating flags
         session.is_generating = False
@@ -1195,136 +1194,7 @@ async def generate_response_with_video(
 # Socket Server for Client Communication
 # ============================================================================
 
-def send_streaming_token_to_client(token: str, response_id: str, is_final: bool = False,
-                                     query: str = None, is_start: bool = False,
-                                     is_silent: bool = False):
-    """Send a streaming token to the client.
-
-    Protocol: Type 8 (STREAMING_TOKEN)
-    - Type 7 is reserved for ERROR messages in the client
-
-    Args:
-        token: The token text to send
-        response_id: Unique response ID
-        is_final: Whether this is the final token
-        query: User query (ASR result) - only sent at start
-        is_start: Whether this is the start of a new response
-        is_silent: Whether this is a silent response (model chose not to respond)
-    """
-    with connection_lock:
-        if active_connection:
-            try:
-                response_data = {
-                    "response_id": response_id,
-                    "token": token,
-                    "is_final": is_final,
-                    "type": "streaming_token"
-                }
-                if is_start:
-                    response_data["is_start"] = True
-                if query:
-                    response_data["query"] = query
-
-                # Mark silent responses so client can handle them appropriately
-                if is_silent:
-                    response_data["is_silent"] = True
-
-                payload = json.dumps(response_data, ensure_ascii=False).encode('utf-8')
-                # Use type 8 for streaming tokens (type 7 is ERROR in client)
-                header = struct.pack(">BQ", 8, len(payload))
-                active_connection.sendall(header + payload)
-            except Exception as e:
-                print(f"Error sending streaming token: {e}")
-
-
-def send_asr_query_to_client(query: str):
-    """Send ASR-transcribed query text to client immediately (before model inference).
-
-    Protocol: Type 10 (ASR_QUERY_ECHO) - a dedicated message type so that
-    clients won't mistake it for a model streaming response (Type 8).
-    This allows the client to display the user's query as soon as ASR finishes,
-    without waiting for the model to start generating (Plan 2 optimization).
-    """
-    with connection_lock:
-        if active_connection:
-            try:
-                response_data = {
-                    "type": "asr_query",
-                    "query": query,
-                }
-                payload = json.dumps(response_data, ensure_ascii=False).encode('utf-8')
-                header = struct.pack(">BQ", 10, len(payload))
-                active_connection.sendall(header + payload)
-                print(f"📤 [Plan2] Sent ASR query to client immediately: {query[:50]}...")
-            except Exception as e:
-                print(f"Error sending ASR query to client: {e}")
-
-
-def send_audio_to_client(audio_bytes: bytes, response_id: str = None,
-                         sentence_idx: int = 0, total_sentences: int = 1):
-    """Send audio data to the connected client.
-
-    Protocol: Type 5 (TTS Audio) - Complete WAV file per sentence
-    """
-    with connection_lock:
-        if active_connection:
-            try:
-                response_id_bytes = (response_id or "").encode('utf-8')
-                response_id_len = len(response_id_bytes)
-
-                # Protocol: Type 5 | length | response_id_len | response_id | sentence_idx | total_sentences | audio_data
-                payload = (
-                    struct.pack(">B", response_id_len) +
-                    response_id_bytes +
-                    struct.pack(">HH", sentence_idx, total_sentences) +
-                    audio_bytes
-                )
-                header = struct.pack(">BQ", 5, len(payload))
-                active_connection.sendall(header + payload)
-                print(f"🔊 Sent TTS sentence {sentence_idx + 1}/{total_sentences} ({len(audio_bytes)} bytes)")
-            except Exception as e:
-                print(f"Error sending audio: {e}")
-
-
-def send_audio_chunk_to_client(pcm_bytes: bytes, response_id: str,
-                                sentence_idx: int, chunk_idx: int,
-                                sample_rate: int, is_final: bool = False):
-    """Send a streaming audio chunk to the client (Raw PCM int16).
-
-    Protocol: Type 9 (TTS Audio Chunk)
-
-    This enables true streaming TTS - each chunk is sent as soon as it's generated,
-    allowing the client to start playback before the entire sentence is synthesized.
-
-    Payload format:
-    - response_id_len (1 byte)
-    - response_id (variable)
-    - sentence_idx (2 bytes, big-endian)
-    - chunk_idx (2 bytes, big-endian)
-    - sample_rate (4 bytes, big-endian)
-    - is_final (1 byte: 0 or 1)
-    - pcm_data (Raw int16 PCM)
-    """
-    with connection_lock:
-        if active_connection:
-            try:
-                response_id_bytes = (response_id or "").encode('utf-8')
-                response_id_len = len(response_id_bytes)
-
-                payload = (
-                    struct.pack(">B", response_id_len) +
-                    response_id_bytes +
-                    struct.pack(">HHIB", sentence_idx, chunk_idx, sample_rate, 1 if is_final else 0) +
-                    pcm_bytes
-                )
-                header = struct.pack(">BQ", 9, len(payload))  # Type 9 for audio chunks
-                active_connection.sendall(header + payload)
-
-                if is_final:
-                    print(f"🔊 [Chunk] Sent final chunk for sentence {sentence_idx} (chunk {chunk_idx})")
-            except Exception as e:
-                print(f"Error sending audio chunk: {e}")
-
+# 4 send_* functions moved to aura/server_io.py — per-session, fail-fast.
 
 
 def recv_exactly(conn, n: int, timeout: float = 30.0) -> bytes:
@@ -1344,13 +1214,8 @@ def recv_exactly(conn, n: int, timeout: float = 30.0) -> bytes:
 
 async def handle_client_connection_async(conn, addr, args):
     """Handle client connection with async support."""
-    global active_connection
-
     print(f"================================================")
     print(f"✅ Connected by {addr} with SUYI")
-
-    with connection_lock:
-        active_connection = conn
 
     # Set socket to blocking mode with timeout
     conn.setblocking(True)
@@ -1387,6 +1252,7 @@ async def handle_client_connection_async(conn, addr, args):
         is_generating=False,
         cross_turn_penalty=penalty_mgr,
     )
+    session.conn = conn
 
     async with session_lock:
         streaming_sessions[session_id] = session
@@ -1591,7 +1457,7 @@ async def handle_client_connection_async(conn, addr, args):
 
                     # Plan 2: ASR query is sent to client immediately,
                     # model inference result will be sent separately later.
-                    send_asr_query_to_client(transcribed_text)
+                    send_asr_query(session, transcribed_text)
 
                     # Optimization: Try to trigger immediately if we have ANY video frames
                     if accumulated_video_frames:
@@ -1649,9 +1515,8 @@ async def handle_client_connection_async(conn, addr, args):
             if session_id in streaming_sessions:
                 del streaming_sessions[session_id]
 
-        with connection_lock:
-            if active_connection == conn:
-                active_connection = None
+        # session.conn may already be None if server_io dropped it on a write error
+        session.conn = None
         conn.close()
 
 
