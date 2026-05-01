@@ -74,6 +74,7 @@ from aura.server_io import (
     send_audio,
     send_audio_chunk,
 )
+from aura.tts import TTSController
 
 # Global configuration
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -135,84 +136,8 @@ def setup_silent_token_id(model_path: str):
 # Global State
 # ============================================================================
 
-# TTS related globals (TTS model is now a remote service)
-tts_enabled = False
-tts_streaming = False
-TTS_OUTPUT_DIR = "tts_results"
-tts_service_url = None  # URL of the standalone TTS service
-
-# TTS pending task management
-pending_tts_task = None
-pending_tts_lock = threading.RLock()
-tts_worker_running = False
-current_tts_response_id = None
-tts_cancel_flag = False
-
-# TTS sentence queue for streaming TTS (new)
-import queue
-tts_sentence_queue = queue.Queue()
-tts_sentence_queue_lock = threading.Lock()
-
-# TTS latency logging
-TTS_LATENCY_LOG_PATH = "tts_latency.log"
-tts_latency_log_lock = threading.Lock()
-
-def log_tts_latency(
-    response_id: str,
-    sentence_idx: int,
-    text: str,
-    first_chunk_latency: float,
-    total_latency: float,
-    audio_duration: float,
-    num_chunks: int,
-    model_type: str = "unknown"
-):
-    """
-    Log TTS latency metrics to file.
-
-    Args:
-        response_id: Unique response ID
-        sentence_idx: Index of the sentence in the response
-        text: The text that was synthesized
-        first_chunk_latency: Time to first audio chunk (seconds)
-        total_latency: Total processing time (seconds)
-        audio_duration: Duration of generated audio (seconds)
-        num_chunks: Number of audio chunks generated
-        model_type: TTS model type (base/custom_voice)
-    """
-    import datetime
-
-    # Calculate RTF (Real-Time Factor) - lower is better
-    rtf = total_latency / audio_duration if audio_duration > 0 else float('inf')
-
-    # Format log entry
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-    text_preview = text[:50].replace('\n', ' ') + ('...' if len(text) > 50 else '')
-
-    log_entry = (
-        f"[{timestamp}] "
-        f"response_id={response_id} | "
-        f"sentence={sentence_idx} | "
-        f"model={model_type} | "
-        f"first_chunk={first_chunk_latency*1000:.1f}ms | "
-        f"total={total_latency*1000:.1f}ms | "
-        f"audio={audio_duration:.2f}s | "
-        f"RTF={rtf:.3f} | "
-        f"chunks={num_chunks} | "
-        f"text=\"{text_preview}\"\n"
-    )
-
-    # Write to log file (thread-safe)
-    with tts_latency_log_lock:
-        try:
-            with open(TTS_LATENCY_LOG_PATH, "a", encoding="utf-8") as f:
-                f.write(log_entry)
-        except Exception as e:
-            print(f"⚠️ Failed to write TTS latency log: {e}")
-
-    # Also print to console for immediate feedback
-    print(f"📊 [TTS Latency] first_chunk={first_chunk_latency*1000:.1f}ms, total={total_latency*1000:.1f}ms, "
-          f"audio={audio_duration:.2f}s, RTF={rtf:.3f}")
+# TTSController owns all TTS state (sentence queue, worker thread, cancel flag).
+tts_ctl = TTSController()
 
 # Streaming session state
 streaming_sessions: dict[str, StreamingSession] = {}
@@ -476,433 +401,8 @@ async def transcribe_audio_async(audio_path: str, asr_url: str) -> str:
         return ""
 
 
-# ============================================================================
-# TTS (Text-to-Speech)
-# ============================================================================
+# TTS pipeline moved to aura/tts.py — see `tts_ctl` above.
 
-def split_text_to_sentences(text: str) -> list:
-    """Split text into sentences, preserving punctuation."""
-    if not text or not text.strip():
-        return []
-    
-    # Split by sentence terminators
-    sentence_pattern = r'([^。！？；.!?;]+[。！？；.!?;]?)'
-    raw_sentences = re.findall(sentence_pattern, text)
-    
-    sentences = []
-    for s in raw_sentences:
-        s = s.strip()
-        if not s:
-            continue
-        
-        # Split long sentences at commas
-        if len(s) > 50:
-            sub_pattern = r'([^，,]+[，,]?)'
-            sub_sentences = re.findall(sub_pattern, s)
-            for sub in sub_sentences:
-                sub = sub.strip()
-                if sub:
-                    sentences.append(sub)
-        else:
-            sentences.append(s)
-    
-    if not sentences and text.strip():
-        sentences = [text.strip()]
-    
-    return sentences
-
-def set_pending_tts_task(task: dict):
-    """Set pending TTS task, overwriting old one and cancelling current."""
-    global pending_tts_task, tts_cancel_flag, current_tts_response_id
-    with pending_tts_lock:
-        old_task = pending_tts_task
-        pending_tts_task = task
-        
-        if current_tts_response_id is not None:
-            tts_cancel_flag = True
-            print(f"⏭ Cancelling current TTS (id={current_tts_response_id})")
-        
-        if old_task is not None:
-            print(f"⏭ Dropping pending TTS task (id={old_task.get('response_id', 'unknown')})")
-
-def get_pending_tts_task() -> dict:
-    global pending_tts_task
-    with pending_tts_lock:
-        task = pending_tts_task
-        pending_tts_task = None
-        return task
-
-
-# ============================================================================
-# TTS Sentence Queue Functions (for streaming TTS)
-# ============================================================================
-
-# Sentence terminators for Chinese and English
-SENTENCE_TERMINATORS = "。！？；.!?;，,"
-SENTENCE_TERMINATORS_SET = set(SENTENCE_TERMINATORS)
-
-def enqueue_tts_sentence(sentence: str, session, response_id: str, sentence_idx: int, args):
-    """
-    Add a sentence to the TTS queue for processing.
-    This enables pipeline parallelism: model generates next sentence while TTS processes current.
-    """
-    if not sentence or not sentence.strip():
-        return
-
-    clean_text = remove_markdown(sentence)
-    if not clean_text.strip():
-        return
-
-    task = {
-        "session": session,
-        "response_id": response_id,
-        "sentence_idx": sentence_idx,
-        "text": clean_text,
-        "language": args.tts_language if args else "Chinese",
-        "speaker": args.tts_speaker if args else "Vivian",
-        "instruct": args.tts_instruct if args else "",
-        "output_dir": args.tts_output_dir if args else "tts_results"
-    }
-
-    tts_sentence_queue.put(task)
-    print(f"🎤 [Queue] Enqueued sentence {sentence_idx}: {clean_text[:30]}... (queue size: {tts_sentence_queue.qsize()})")
-
-
-def clear_tts_sentence_queue(new_response_id: str = None):
-    """
-    Clear the TTS sentence queue (pending sentences only).
-    Called when a new response starts or when interrupted.
-
-    Note: This does NOT cancel the currently processing TTS task.
-    The current TTS will complete normally, only queued sentences are cleared.
-    """
-    with tts_sentence_queue_lock:
-        # Clear queue (pending sentences only, don't cancel current TTS)
-        cleared = 0
-        while not tts_sentence_queue.empty():
-            try:
-                tts_sentence_queue.get_nowait()
-                cleared += 1
-            except queue.Empty:
-                break
-
-        if cleared > 0:
-            print(f"🗑 Cleared {cleared} pending TTS sentences (current TTS continues)")
-
-
-def get_tts_sentence_task(timeout: float = 0.1):
-    """
-    Get a sentence task from the queue.
-    Returns None if queue is empty after timeout.
-    """
-    try:
-        return tts_sentence_queue.get(timeout=timeout)
-    except queue.Empty:
-        return None
-
-def should_cancel_tts() -> bool:
-    global tts_cancel_flag
-    with pending_tts_lock:
-        return tts_cancel_flag
-
-def clear_cancel_flag():
-    global tts_cancel_flag
-    with pending_tts_lock:
-        tts_cancel_flag = False
-
-def init_tts_model(args) -> bool:
-    """Verify the remote TTS service is reachable."""
-    global tts_enabled, tts_streaming, tts_service_url
-
-    url = getattr(args, "tts_service_url", None)
-    if not url:
-        print("⚠️ --tts-service-url not specified")
-        tts_enabled = False
-        return False
-
-    tts_service_url = url.rstrip("/")
-    print(f"🔊 Checking TTS service at {tts_service_url} ...")
-
-    try:
-        resp = requests.get(f"{tts_service_url}/v1/tts/health", timeout=10)
-        resp.raise_for_status()
-        info = resp.json()
-        print(f"✓ TTS service connected: {info}")
-        tts_streaming = True
-        tts_enabled = True
-        return True
-    except Exception as e:
-        print(f"⚠️ TTS service unreachable ({tts_service_url}): {e}")
-        tts_enabled = False
-        return False
-
-def _text_to_speech_generator(text: str,
-                         language: str = "Chinese",
-                         speaker: str = "Vivian",
-                         instruct: str = ""):
-    """Stream PCM chunks from the remote TTS service.
-
-    The service returns a binary stream where each chunk is:
-        [sample_rate : 4 bytes big-endian uint32]
-        [pcm_length  : 4 bytes big-endian uint32]
-        [pcm_data    : pcm_length bytes, int16 LE]
-    """
-    print(f"🎤 [Remote] Requesting TTS: {text[:40]}...")
-
-    try:
-        resp = requests.post(
-            f"{tts_service_url}/v1/tts/stream",
-            json={"text": text, "language": language, "speaker": speaker, "instruct": instruct},
-            stream=True,
-            timeout=(5, 120),
-        )
-        resp.raise_for_status()
-
-        buf = b""
-        for raw_chunk in resp.iter_content(chunk_size=8192):
-            buf += raw_chunk
-            while len(buf) >= 8:
-                sr, pcm_len = struct.unpack(">II", buf[:8])
-                if len(buf) < 8 + pcm_len:
-                    break
-                pcm_data = buf[8 : 8 + pcm_len]
-                buf = buf[8 + pcm_len :]
-                yield pcm_data, sr
-
-    except Exception as e:
-        print(f"TTS remote call error: {e}")
-        import traceback
-        traceback.print_exc()
-
-def merge_short_sentences(sentences: list, min_chars: int = 15) -> list:
-    """Merge short sentences to reduce TTS calls and improve naturalness."""
-    if not sentences:
-        return sentences
-    
-    merged = []
-    buffer = ""
-    
-    for s in sentences:
-        if len(buffer) + len(s) < min_chars * 3:  # Allow merging up to ~45 chars
-            buffer = (buffer + s) if buffer else s
-        else:
-            if buffer:
-                merged.append(buffer)
-            buffer = s
-    
-    if buffer:
-        merged.append(buffer)
-    
-    return merged
-
-
-def tts_worker_loop(args):
-    """
-    TTS worker thread loop - now uses sentence queue for streaming TTS.
-
-    New behavior (Step 1 + Step 2):
-    - Pulls individual sentences from tts_sentence_queue
-    - Each sentence is processed immediately when enqueued by model generation
-    - Pipeline parallelism: model generates next sentence while TTS processes current
-    - TRUE STREAMING: Each audio chunk is sent immediately via Type 9 protocol
-      (No more collecting all chunks before sending)
-
-    Protocol modes:
-    - Base model: Type 9 (TTS Audio Chunk) - true streaming PCM chunks
-    - CustomVoice model: Type 5 (TTS Audio) - complete WAV (no true streaming available)
-    """
-    global current_tts_response_id
-
-    # Query model type from remote TTS service
-    model_type = "base"
-    try:
-        resp = requests.get(f"{tts_service_url}/v1/tts/health", timeout=5)
-        if resp.ok:
-            model_type = resp.json().get("model_type", "base")
-    except Exception:
-        pass
-
-    # Determine if we can use chunk streaming (only Base model supports true streaming)
-    use_chunk_streaming = (model_type == "base")
-
-    print(f"🔊 TTS Worker started (Remote service, Model: {model_type}, Chunk Streaming: {use_chunk_streaming})")
-
-    import numpy as np
-    import soundfile as sf
-    import io
-    import time as _time
-
-    while True:
-        # Get sentence task from queue (blocking with timeout)
-        task = get_tts_sentence_task(timeout=0.1)
-
-        if task is None:
-            # No task available, continue waiting
-            continue
-
-        try:
-            sentence_start = _time.time()
-            first_chunk_sent = False
-
-            session = task.get("session")
-            if session is None:
-                continue  # tasks enqueued without a session (shouldn't happen post-refactor)
-            response_id = task.get("response_id", "")
-            sentence_idx = task.get("sentence_idx", 0)
-            text = task.get("text", "")
-            language = task.get("language", "Chinese")
-            speaker = task.get("speaker", "Vivian")
-            instruct = task.get("instruct", "")
-
-            if not text.strip():
-                continue
-
-            with pending_tts_lock:
-                current_tts_response_id = response_id
-                clear_cancel_flag()
-
-            print(f"🎤 [TTS] Processing sentence {sentence_idx}: {text[:40]}...")
-
-            chunk_idx = 0
-            sr = 24000
-            total_samples = 0
-            first_chunk_latency = 0.0
-
-            if use_chunk_streaming:
-                # ========== TRUE STREAMING MODE (Base model) ==========
-                # Send each chunk immediately via Type 9 protocol
-                for audio_bytes, sample_rate in _text_to_speech_generator(
-                    text, language, speaker, instruct
-                ):
-                    if should_cancel_tts():
-                        print(f"⏹ TTS cancelled for sentence {sentence_idx}")
-                        break
-
-                    sr = sample_rate
-                    total_samples += len(audio_bytes) // 2  # int16 = 2 bytes per sample
-
-                    # Send chunk immediately (not collecting!)
-                    send_audio_chunk(
-                        session,
-                        pcm_bytes=audio_bytes,
-                        response_id=response_id,
-                        sentence_idx=sentence_idx,
-                        chunk_idx=chunk_idx,
-                        sample_rate=sr,
-                        is_final=False
-                    )
-
-                    if not first_chunk_sent:
-                        first_chunk_latency = _time.time() - sentence_start
-                        print(f"🚀 [TTS] First chunk sent in {first_chunk_latency:.3f}s")
-                        first_chunk_sent = True
-
-                    chunk_idx += 1
-
-                # Log TTS latency metrics - always log if any chunks were processed
-                # (moved outside of cancel check to avoid race condition)
-                if chunk_idx > 0:
-                    sentence_time = _time.time() - sentence_start
-                    audio_duration = total_samples / sr if sr > 0 else 0
-
-                    # Log latency regardless of cancel status
-                    log_tts_latency(
-                        response_id=response_id,
-                        sentence_idx=sentence_idx,
-                        text=text,
-                        first_chunk_latency=first_chunk_latency,
-                        total_latency=sentence_time,
-                        audio_duration=audio_duration,
-                        num_chunks=chunk_idx,
-                        model_type=model_type
-                    )
-
-                    # Send final marker only if not cancelled
-                    if not should_cancel_tts():
-                        send_audio_chunk(
-                            session,
-                            pcm_bytes=b'',  # Empty data for final marker
-                            response_id=response_id,
-                            sentence_idx=sentence_idx,
-                            chunk_idx=chunk_idx,
-                            sample_rate=sr,
-                            is_final=True
-                        )
-                        print(f"🔊 [TTS] Sentence {sentence_idx} complete: {chunk_idx} chunks, "
-                              f"{audio_duration:.1f}s audio in {sentence_time:.2f}s")
-                    else:
-                        print(f"⏹ [TTS] Sentence {sentence_idx} cancelled after {chunk_idx} chunks")
-
-            else:
-                # ========== LEGACY MODE (CustomVoice model) ==========
-                # Collect all chunks, send as complete WAV via Type 5 protocol
-                audio_parts = []
-
-                for audio_bytes, sample_rate in _text_to_speech_generator(
-                    text, language, speaker, instruct
-                ):
-                    if should_cancel_tts():
-                        print(f"⏹ TTS cancelled for sentence {sentence_idx}")
-                        break
-
-                    # Record first chunk time for CustomVoice too
-                    if not first_chunk_sent:
-                        first_chunk_latency = _time.time() - sentence_start
-                        first_chunk_sent = True
-
-                    audio_parts.append(np.frombuffer(audio_bytes, dtype=np.int16))
-                    sr = sample_rate
-
-                # Log TTS latency metrics - always log if any chunks were processed
-                # (moved outside of cancel check to avoid race condition)
-                if audio_parts:
-                    full_audio = np.concatenate(audio_parts)
-                    sentence_time = _time.time() - sentence_start
-                    audio_duration = len(full_audio) / sr
-
-                    # Log latency regardless of cancel status
-                    log_tts_latency(
-                        response_id=response_id,
-                        sentence_idx=sentence_idx,
-                        text=text,
-                        first_chunk_latency=first_chunk_latency,
-                        total_latency=sentence_time,
-                        audio_duration=audio_duration,
-                        num_chunks=len(audio_parts),
-                        model_type=model_type
-                    )
-
-                    # Send complete WAV only if not cancelled
-                    if not should_cancel_tts():
-                        # Write to WAV buffer
-                        wav_buffer = io.BytesIO()
-                        sf.write(wav_buffer, full_audio, sr, format='WAV')
-                        wav_bytes = wav_buffer.getvalue()
-
-                        # Send complete WAV
-                        estimated_total = sentence_idx + 1
-                        send_audio(session, wav_bytes, response_id, sentence_idx, estimated_total)
-                        print(f"🔊 [TTS] Sent sentence {sentence_idx} ({audio_duration:.1f}s WAV in {sentence_time:.2f}s)")
-                    else:
-                        print(f"⏹ [TTS] Sentence {sentence_idx} cancelled after {len(audio_parts)} chunks")
-
-            with pending_tts_lock:
-                current_tts_response_id = None
-
-        except Exception as e:
-            print(f"TTS Worker error: {e}")
-            import traceback
-            traceback.print_exc()
-            import traceback
-            traceback.print_exc()
-
-def start_tts_worker(args):
-    """Start the TTS worker thread."""
-    global tts_worker_running
-    if not tts_worker_running:
-        tts_worker_running = True
-        t = threading.Thread(target=tts_worker_loop, args=(args,), daemon=True)
-        t.start()
 
 # ============================================================================
 # AsyncLLM Engine Management
@@ -1055,10 +555,10 @@ async def generate_response_with_video(
         is_silent_response = False
         ttft = 0
 
-        tts_enabled_for_this_response = args and args.enable_tts and tts_enabled
+        tts_enabled_for_this_response = args and args.enable_tts and tts_ctl.enabled
 
         if tts_enabled_for_this_response and prompt:
-            clear_tts_sentence_queue(new_response_id=request_id)
+            tts_ctl.clear_queue(new_response_id=request_id)
 
         # Timing measurements
         generation_start_time = time.time()
@@ -1129,7 +629,7 @@ async def generate_response_with_video(
                                 sentence = _tts_sentence_buf[:split_pos]
                                 _tts_sentence_buf = _tts_sentence_buf[split_pos:]
                                 if sentence.strip():
-                                    enqueue_tts_sentence(sentence, session, request_id, _tts_sentence_idx, args)
+                                    tts_ctl.enqueue_sentence(sentence, session, request_id, _tts_sentence_idx, args)
                                     _tts_sentence_idx += 1
 
         # ===== Generation finished — decide: silent / send =====
@@ -1166,7 +666,7 @@ async def generate_response_with_video(
 
             # Flush remaining TTS sentence buffer
             if tts_enabled_for_this_response and _tts_sentence_buf.strip():
-                enqueue_tts_sentence(_tts_sentence_buf, session, request_id, _tts_sentence_idx, args)
+                tts_ctl.enqueue_sentence(_tts_sentence_buf, session, request_id, _tts_sentence_idx, args)
                 _tts_sentence_idx += 1
 
             if tts_enabled_for_this_response:
@@ -1727,8 +1227,8 @@ async def main_async(args):
 
     # Initialize TTS if enabled
     if args.enable_tts:
-        if init_tts_model(args):
-            start_tts_worker(args)
+        if tts_ctl.configure(args):
+            tts_ctl.start_worker(args)
         else:
             print("⚠ TTS initialization failed, TTS will be disabled")
     # print("⚠ TTS initialization failed, TTS will be disabled")
