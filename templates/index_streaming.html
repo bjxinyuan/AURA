@@ -433,8 +433,6 @@
         let audioStartTime = null;
         let pollInterval = null;
         let ttsAudioPollInterval = null;  // TTS 音频轮询定时器
-        let errorPollInterval = null;  // 错误轮询定时器
-        let streamingTokenPollInterval = null;  // 流式 token 轮询定时器 (新增)
         let currentStreamingBubble = null;  // 当前流式显示的气泡 (新增)
         let currentStreamingResponseId = null;  // 当前流式的 response_id (新增)
         const streamedResponseIds = new Set();  // 已通过流式显示的 response_id 集合（防止重复）
@@ -456,6 +454,7 @@
         let sendCanvas = null;
         let sendCanvasCtx = null;
         let sendStream = null;
+        let eventSource = null;  // SSE connection
         let canvasDrawInterval = null;
         
         // ========== Web Audio API for streaming PCM playback (Step 2) ==========
@@ -465,7 +464,6 @@
         let webAudioCurrentResponseId = null;  // 当前播放的 response_id
         let webAudioCurrentSentenceIdx = -1;  // 当前播放的句子索引
         let webAudioSampleRate = 24000;  // 采样率 (从服务端获取)
-        let ttsChunkPollInterval = null;  // PCM chunk 轮询定时器
         let webAudioNextPlayTime = 0;  // 下一个 chunk 的播放时间
         let webAudioActiveSources = [];  // 跟踪当前正在播放的 AudioBufferSourceNode (用于中断播放)
         // ========== End Web Audio API ==========
@@ -705,19 +703,8 @@
                 ttsAudioPollInterval = null;
             }
             
-            if (errorPollInterval) {
-                clearTimeout(errorPollInterval);
-                errorPollInterval = null;
-            }
-            
-            // 停止流式 token 轮询
-            if (streamingTokenPollInterval) {
-                clearTimeout(streamingTokenPollInterval);
-                streamingTokenPollInterval = null;
-            }
-            
             // 停止 TTS chunk 轮询 (Step 2)
-            stopPollingTtsChunk();
+            stopEventStream();
             
             // 停止 TTS 音频
             stopTtsAudio();
@@ -785,7 +772,7 @@
                 
                 // 停止所有正在进行的播放和轮询
                 stopTtsAudio();
-                stopPollingTtsChunk();
+                stopEventStream();
                 
                 const response = await fetch('/api/force_release_session', { method: 'POST' });
                 const result = await response.json();
@@ -848,17 +835,11 @@
             // NOTE: 完整响应轮询已移除，所有内容通过流式 token 接收
             // startPollingResponse();  // REMOVED - using streaming tokens only
             
-            // 启动流式 token 轮询 (包含 query 和 response)
-            startPollingStreamingToken();
-            
-            // 启动 TTS 音频轮询 (Type 5 - WAV)
+            // 启动 SSE 连接 (token + chunk + error 三合一)
+            startEventStream();
+
+            // 启动 TTS 音频轮询 (Type 5 - WAV, legacy path)
             startPollingTtsAudio();
-            
-            // 启动 TTS 音频 chunk 轮询 (Type 9 - PCM) - Step 2
-            startPollingTtsChunk();
-            
-            // 启动错误轮询（检测会话被占用等）
-            startPollingError();
             
             // 再次尝试解锁音频（以防之前失败）
             unlockAudioContext();
@@ -1273,46 +1254,75 @@
         
         // =============== 流式 Token 功能 ===============
         
-        // 开始轮询流式 token
-        let isPollingStreamingToken = false;
-        async function pollStreamingToken() {
-            if (!isVideoStreaming) {
-                streamingTokenPollInterval = null;
-                return;
-            }
-            if (isPollingStreamingToken) return;
+        // =============== SSE Event Stream ===============
 
-            isPollingStreamingToken = true;
-            try {
-                const response = await fetch(`/api/poll_streaming_token?session_id=${encodeURIComponent(currentSessionId || '')}`);
-                const data = await response.json();
-                
-                if (data.success && data.tokens && data.tokens.length > 0) {
-                    // 处理所有收到的 token
-                    for (const tokenStr of data.tokens) {
-                        try {
-                            const tokenData = JSON.parse(tokenStr);
-                            handleStreamingToken(tokenData);
-                        } catch (e) {
-                            console.error("解析流式 token 失败:", e, tokenStr);
-                        }
+        function startEventStream() {
+            stopEventStream();
+            const url = `/api/events?session_id=${encodeURIComponent(currentSessionId || '')}`;
+            eventSource = new EventSource(url);
+
+            eventSource.addEventListener('token', (e) => {
+                try {
+                    const payload = JSON.parse(e.data);
+                    // payload.raw is the JSON token envelope produced by the inference server
+                    const tokenData = JSON.parse(payload.raw);
+                    handleStreamingToken(tokenData);
+                } catch (err) {
+                    console.error('Failed to parse token event:', err, e.data);
+                }
+            });
+
+            eventSource.addEventListener('chunk', (e) => {
+                try {
+                    const c = JSON.parse(e.data);
+                    playPcmChunk(
+                        c.pcm_base64,
+                        c.sample_rate,
+                        c.response_id,
+                        c.sentence_idx,
+                        c.chunk_idx,
+                        c.is_final
+                    );
+                } catch (err) {
+                    console.error('Failed to parse chunk event:', err);
+                }
+            });
+
+            eventSource.addEventListener('error', (e) => {
+                // Named "error" events carry server-reported errors (session rejection etc).
+                // EventSource also emits onerror() for network failures — those have no data.
+                if (e.data) {
+                    try {
+                        const { message } = JSON.parse(e.data);
+                        log(`⚠️ 服务端错误: ${message}`, 'error');
+                        alert(`连接被拒绝: ${message}`);
+                        stopVideo();
+                    } catch (err) {
+                        console.error('Failed to parse error event:', err);
                     }
                 }
-            } catch (e) {
-                console.error("Streaming token polling error:", e);
-            } finally {
-                isPollingStreamingToken = false;
-                if (isVideoStreaming) {
-                    streamingTokenPollInterval = setTimeout(pollStreamingToken, 100);
-                }
-            }
+            });
+
+            eventSource.addEventListener('close', () => {
+                stopEventStream();
+            });
+
+            eventSource.onerror = (err) => {
+                // Network-level failure. EventSource will auto-reconnect by default.
+                console.warn('EventSource transport error (will retry):', err);
+            };
         }
 
-        function startPollingStreamingToken() {
-            if (streamingTokenPollInterval) clearTimeout(streamingTokenPollInterval);
-            streamingTokenPollInterval = setTimeout(pollStreamingToken, 100);
+        function stopEventStream() {
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+            }
+            // Stop any Web Audio playback that was being fed by chunks.
+            stopAllWebAudioPlayback(true);
+            webAudioCurrentResponseId = null;
         }
-        
+
         // 处理单个流式 token
         function handleStreamingToken(tokenData) {
             const { response_id, token, is_final, type, query, is_start, is_silent } = tokenData;
@@ -1478,81 +1488,6 @@
         }
         
         // =============== 流式 Token 功能结束 ===============
-        
-        // 开始轮询错误消息（检测会话被占用等情况）
-        let isPollingError = false;
-        async function pollError() {
-            if (!isVideoStreaming) {
-                errorPollInterval = null;
-                return;
-            }
-            if (isPollingError) return;
-
-            isPollingError = true;
-            try {
-                const response = await fetch(`/api/poll_error?session_id=${encodeURIComponent(currentSessionId || '')}`);
-                const data = await response.json();
-                
-                if (data.success && data.has_error) {
-                    // 收到错误消息，显示并停止视频
-                    log(`⚠️ 服务端错误: ${data.error}`, 'error');
-                    alert(`连接被拒绝: ${data.error}`);
-                    stopVideo();
-                }
-            } catch (e) {
-                console.error("Error polling error:", e);
-            } finally {
-                isPollingError = false;
-                if (isVideoStreaming) {
-                    errorPollInterval = setTimeout(pollError, 1000);
-                }
-            }
-        }
-
-        function startPollingError() {
-            if (errorPollInterval) clearTimeout(errorPollInterval);
-            errorPollInterval = setTimeout(pollError, 1000);
-        }
-        
-        // 停止错误轮询
-        function stopPollingError() {
-            if (errorPollInterval) {
-                clearTimeout(errorPollInterval);
-                errorPollInterval = null;
-            }
-        }
-        
-        // 显示等待响应状态
-        function showWaitingResponse() {
-            const time = new Date().toLocaleTimeString();
-            responseContent.innerHTML = `
-                <div style="display: flex; align-items: center; gap: 10px;">
-                    <div class="loading-spinner"></div>
-                    <div>
-                        <div style="color: #00d9ff;">等待 VLLM 响应中...</div>
-                        <div style="color: #8892b0; font-size: 0.8rem;">${time}</div>
-                    </div>
-                </div>
-            `;
-            responsePanel.classList.add('visible');
-        }
-        
-        // 隐藏等待状态
-        function hideWaitingResponse() {
-            // 保持面板可见，但清空内容
-        }
-        
-        // 响应计数器
-        let responseCounter = 0;
-        
-        // 浮动响应配置
-        const FLOATING_RESPONSE_MAX = 2;  // 最多同时显示的响应数量
-        const FLOATING_RESPONSE_DURATION = 15000;  // 响应显示时长（毫秒）
-        const FLOATING_RESPONSE_FADE_DURATION = 1000;  // 淡出动画时长（毫秒）
-        const recentQueries = new Set(); // 记录最近显示的查询，防止重复
-        
-        // 已显示的响应内容（用于基于内容的去重）
-        const recentResponseTexts = new Set();
         
         // =============== showResponse - 已废弃 ===============
         // NOTE: 此函数已不再使用，所有响应通过流式 token (handleStreamingToken) 显示
@@ -1831,58 +1766,6 @@
             } catch (e) {
                 console.error('PCM 播放错误:', e);
             }
-        }
-        
-        // 轮询 TTS 音频 chunk
-        let isPollingTtsChunk = false;
-        async function pollTtsAudioChunk() {
-            if (!isVideoStreaming) {
-                ttsChunkPollInterval = null;
-                return;
-            }
-            if (isPollingTtsChunk) return;
-            
-            isPollingTtsChunk = true;
-            try {
-                const response = await fetch(`/api/poll_tts_audio_chunk?session_id=${encodeURIComponent(currentSessionId || '')}`);
-                const data = await response.json();
-                
-                if (data.success && data.chunks && data.chunks.length > 0) {
-                    for (const chunk of data.chunks) {
-                        playPcmChunk(
-                            chunk.pcm_base64,
-                            chunk.sample_rate,
-                            chunk.response_id,
-                            chunk.sentence_idx,
-                            chunk.chunk_idx,
-                            chunk.is_final
-                        );
-                    }
-                }
-            } catch (e) {
-                console.error('TTS chunk polling error:', e);
-            } finally {
-                isPollingTtsChunk = false;
-                if (isVideoStreaming) {
-                    // 更快的轮询间隔以保证流畅播放
-                    ttsChunkPollInterval = setTimeout(pollTtsAudioChunk, 50);
-                }
-            }
-        }
-        
-        function startPollingTtsChunk() {
-            if (ttsChunkPollInterval) clearTimeout(ttsChunkPollInterval);
-            ttsChunkPollInterval = setTimeout(pollTtsAudioChunk, 50);
-        }
-        
-        function stopPollingTtsChunk() {
-            if (ttsChunkPollInterval) {
-                clearTimeout(ttsChunkPollInterval);
-                ttsChunkPollInterval = null;
-            }
-            // 停止所有正在播放的音频
-            stopAllWebAudioPlayback(true);
-            webAudioCurrentResponseId = null;
         }
         
         // =============== Web Audio API 结束 ===============

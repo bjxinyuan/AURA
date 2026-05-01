@@ -3,11 +3,11 @@ Realtime Video Audio Capture Client - Streaming Version
 
 支持 Qwen3_VL_online_streaming.py 的流式输入/输出协议。
 
-主要改动:
-1. 添加 Type 8 (STREAMING_TOKEN_TYPE) 处理流式 token
-2. 添加 streaming_token_queue 队列
-3. 添加 /api/poll_streaming_token 接口
-4. 保持与原版的向后兼容
+Downstream messages from the main inference service are fanned out
+from a background TCP receive thread onto a multiplexed event_queue,
+and the browser subscribes via /api/events (SSE). Legacy Type 3/5
+full-response paths are still polled (/api/poll_response,
+/api/poll_tts_audio) to preserve back-compat.
 
 协议定义:
 - Type 1: VIDEO (C->S)
@@ -22,11 +22,14 @@ Realtime Video Audio Capture Client - Streaming Version
 
 import argparse
 import os
+import base64
 import struct
 import socket
 import threading
 import time
 import queue
+
+from aura.sse import format_sse_stream
 from collections import deque
 from flask import Flask, render_template, request, jsonify, Response
 from flask_cors import CORS
@@ -68,16 +71,14 @@ last_connect_attempt = 0
 connect_retry_interval = 5
 connection_error_logged = False
 
-# 响应队列，用于存储服务端返回的消息
+# Legacy queues (Type 3 full-response and Type 5 complete-WAV TTS paths).
+# Still polled by /api/poll_response and /api/poll_tts_audio — see README.
 response_queue = queue.Queue()
-# TTS 音频队列，用于存储服务端返回的 TTS 音频 (WAV - Type 5)
 tts_audio_queue = queue.Queue()
-# TTS 音频 chunk 队列 (Raw PCM - Type 9) - Step 2 新增
-tts_audio_chunk_queue = queue.Queue()
-# 错误队列，用于存储服务端返回的错误消息（如会话被占用）
-error_queue = queue.Queue()
-# 流式 token 队列
-streaming_token_queue = queue.Queue()
+
+# Multiplexed event queue drained by /api/events (SSE). Each item is a
+# (kind, payload_dict) tuple. Kinds: "token", "chunk", "error", "close".
+event_queue = queue.Queue()
 
 # 用户会话锁：确保同时只有一个浏览器用户可以使用系统
 user_session_lock = threading.Lock()
@@ -175,7 +176,7 @@ def receive_thread_func():
                 # 服务器错误/拒绝消息
                 error_msg = data.decode('utf-8')
                 logger.warning(f"⚠️ 服务端错误: {error_msg}")
-                error_queue.put(error_msg)
+                event_queue.put(("error", {"message": error_msg}))
                 # 关闭连接，因为服务器已拒绝
                 with socket_lock:
                     if global_socket == sock:
@@ -187,20 +188,22 @@ def receive_thread_func():
                 break  # 退出接收循环
             
             elif msg_type == STREAMING_TOKEN_TYPE:
-                # 流式 token (新增)
+                # Streaming model output → SSE "token" event; payload.raw
+                # is the original JSON-encoded token envelope from backend.
                 try:
                     token_data = data.decode('utf-8')
                     logger.debug(f"📝 收到流式 token: {token_data[:50]}...")
-                    streaming_token_queue.put(token_data)
+                    event_queue.put(("token", {"raw": token_data}))
                 except Exception as e:
                     logger.error(f"解析流式 token 失败: {e}")
             
             elif msg_type == ASR_QUERY_ECHO_TYPE:
-                # Plan 2: ASR query echo - 立即回传用户转写文字
+                # Plan 2: ASR query echo — share the "token" channel because
+                # the frontend routes both through handleStreamingToken.
                 try:
                     token_data = data.decode('utf-8')
                     logger.info(f"📤 收到 ASR query echo: {token_data[:50]}...")
-                    streaming_token_queue.put(token_data)
+                    event_queue.put(("token", {"raw": token_data}))
                 except Exception as e:
                     logger.error(f"解析 ASR query echo 失败: {e}")
             
@@ -258,14 +261,14 @@ def receive_thread_func():
                         if chunk_idx % 10 == 0:
                             logger.info(f"🔊 收到 TTS chunk sentence={sentence_idx} chunk={chunk_idx} ({len(pcm_data)} bytes)")
                     
-                    tts_audio_chunk_queue.put({
+                    event_queue.put(("chunk", {
                         "response_id": response_id,
                         "sentence_idx": sentence_idx,
                         "chunk_idx": chunk_idx,
                         "sample_rate": sample_rate,
                         "is_final": bool(is_final),
-                        "pcm_data": pcm_data
-                    })
+                        "pcm_base64": base64.b64encode(pcm_data).decode("ascii") if pcm_data else "",
+                    }))
                 except Exception as parse_e:
                     logger.error(f"解析 TTS 音频 chunk 协议失败: {parse_e}")
                 
@@ -405,40 +408,6 @@ def poll_response():
             'response': None
         })
 
-@app.route('/api/poll_streaming_token', methods=['GET'])
-def poll_streaming_token():
-    """轮询获取流式 token (新增)"""
-    session_id = request.args.get('session_id')
-    if not verify_session(session_id):
-        return get_session_error_response()
-    
-    try:
-        # 获取所有可用的 token
-        tokens = []
-        while True:
-            try:
-                token = streaming_token_queue.get_nowait()
-                tokens.append(token)
-            except queue.Empty:
-                break
-        
-        if tokens:
-            return jsonify({
-                'success': True,
-                'tokens': tokens
-            })
-        else:
-            return jsonify({
-                'success': False,
-                'tokens': []
-            })
-    except Exception as e:
-        logger.error(f"获取流式 token 失败: {e}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        })
-
 @app.route('/api/poll_tts_audio', methods=['GET'])
 def poll_tts_audio():
     """轮询获取 TTS 音频"""
@@ -477,55 +446,6 @@ def poll_tts_audio():
             'audio': None
         })
 
-@app.route('/api/poll_tts_audio_chunk', methods=['GET'])
-def poll_tts_audio_chunk():
-    """轮询获取 TTS 音频 chunk (Raw PCM int16) - Step 2 新增
-    
-    Returns all available chunks at once for efficiency.
-    Frontend uses Web Audio API to decode and play PCM data.
-    """
-    session_id = request.args.get('session_id')
-    if not verify_session(session_id):
-        return get_session_error_response()
-    
-    try:
-        # 获取所有可用的 chunks
-        chunks = []
-        while True:
-            try:
-                chunk = tts_audio_chunk_queue.get_nowait()
-                chunks.append(chunk)
-            except queue.Empty:
-                break
-        
-        if chunks:
-            # 返回所有 chunks 的 JSON 数组
-            # 前端会解析并播放
-            logger.info(f"🔊 返回 {len(chunks)} 个 TTS chunk 给前端")
-            return jsonify({
-                'success': True,
-                'chunks': [{
-                    'response_id': c['response_id'],
-                    'sentence_idx': c['sentence_idx'],
-                    'chunk_idx': c['chunk_idx'],
-                    'sample_rate': c['sample_rate'],
-                    'is_final': c['is_final'],
-                    # PCM data 需要 base64 编码
-                    'pcm_base64': __import__('base64').b64encode(c['pcm_data']).decode('ascii') if c['pcm_data'] else ''
-                } for c in chunks]
-            })
-        else:
-            return jsonify({
-                'success': False,
-                'chunks': []
-            })
-    except Exception as e:
-        logger.error(f"获取 TTS 音频 chunk 失败: {e}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        })
-
 @app.route('/api/status', methods=['GET'])
 def get_status():
     """获取连接状态"""
@@ -535,26 +455,26 @@ def get_status():
         'server': f"{SERVER_HOST}:{SERVER_PORT}"
     })
 
-@app.route('/api/poll_error', methods=['GET'])
-def poll_error():
-    """轮询获取服务端错误消息"""
-    session_id = request.args.get('session_id')
+@app.route('/api/events')
+def events():
+    """Multiplexed Server-Sent Events stream — replaces poll_streaming_token,
+    poll_tts_audio_chunk, and poll_error in one persistent connection."""
+    session_id = request.args.get('session_id', '')
     if not verify_session(session_id):
-        return get_session_error_response()
-    
-    try:
-        error_msg = error_queue.get_nowait()
-        return jsonify({
-            'success': True,
-            'has_error': True,
-            'error': error_msg
-        })
-    except queue.Empty:
-        return jsonify({
-            'success': True,
-            'has_error': False,
-            'error': None
-        })
+        def _error_stream():
+            yield ": session-invalid\n\n"
+            yield 'event: error\ndata: {"message": "invalid session"}\n\n'
+        return Response(_error_stream(), mimetype='text/event-stream')
+
+    return Response(
+        format_sse_stream(event_queue, heartbeat_seconds=15.0),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no',
+        },
+    )
+
 
 @app.route('/api/acquire_session', methods=['POST'])
 def acquire_session():
@@ -568,13 +488,11 @@ def acquire_session():
             current_user_session = new_session_id
             
             # 清空残留的队列数据
-            global response_queue, tts_audio_queue, tts_audio_chunk_queue, error_queue, streaming_token_queue
+            global response_queue, tts_audio_queue, event_queue
             response_queue = queue.Queue()
             tts_audio_queue = queue.Queue()
-            tts_audio_chunk_queue = queue.Queue()
-            error_queue = queue.Queue()
-            streaming_token_queue = queue.Queue()
-            
+            event_queue = queue.Queue()
+
             logger.info(f"✅ 用户获取会话锁: {new_session_id}，已清空残留队列")
             return jsonify({
                 'success': True,
@@ -596,6 +514,8 @@ def force_release_session():
         if current_user_session is not None:
             old_session = current_user_session
             current_user_session = None
+            # Tell any open SSE stream to wind down cleanly.
+            event_queue.put(("close", {}))
             logger.info(f"🔓 会话已释放: {old_session}")
             return jsonify({
                 'success': True,
