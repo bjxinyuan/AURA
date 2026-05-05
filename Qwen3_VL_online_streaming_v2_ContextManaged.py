@@ -557,6 +557,222 @@ def recv_exactly(conn, n: int, timeout: float = 30.0) -> bytes:
     return data
 
 
+async def _read_header(conn) -> Optional[tuple]:
+    """Read a 9-byte protocol header. Returns (file_type, file_len) or None
+    when the peer disconnects or the socket errors out. Idle timeouts
+    simply return a sentinel ("timeout",) so the caller can continue
+    waiting without treating it as an error."""
+    try:
+        header = await asyncio.get_event_loop().run_in_executor(
+            None, recv_exactly, conn, 9, 5.0
+        )
+    except TimeoutError:
+        return ("timeout",)
+    except ConnectionError:
+        print("🔌 Client disconnected")
+        return None
+    except OSError as e:
+        print(f"❌ Header read error: {e}")
+        return None
+
+    file_type, file_len = struct.unpack(">BQ", header)
+    print(f"📩 Received: type={file_type}, length={file_len}, time={datetime.now().strftime('%H:%M:%S.%f')}")
+    return file_type, file_len
+
+
+async def _read_payload(conn, file_len: int) -> Optional[bytes]:
+    """Read `file_len` bytes of payload. Returns the bytes, or None when
+    the socket errors out. On a timeout returns the sentinel ``b"\\x00TIMEOUT"``
+    wrapper? Simpler: return empty bytes on timeout so caller can skip
+    the message without breaking the loop."""
+    try:
+        return await asyncio.get_event_loop().run_in_executor(
+            None, recv_exactly, conn, file_len, 30.0
+        )
+    except TimeoutError:
+        print(f"⚠ Timeout reading {file_len} bytes, skipping")
+        return b""
+    except ConnectionError:
+        print("🔌 Client disconnected during data read")
+        return None
+    except OSError as e:
+        print(f"❌ Data read error: {e}")
+        return None
+
+
+def _reset_session_state(session: StreamingSession, reason: str):
+    """Cancel any running generation task and clear per-connection scratch
+    state. Shared by the Clear-Context (Type 4) and Start-Camera (Type 6)
+    branches — they differ only in log message."""
+    print(reason)
+    if session.current_task and not session.current_task.done():
+        print("⏹ Cancelling running generation task...")
+        session.current_task.cancel()
+        session.is_generating = False
+        session.is_auto_generating = False
+    session.history._reset()
+    if session.cross_turn_penalty is not None:
+        session.cross_turn_penalty.reset()
+    session.accumulated_video_frames = []
+    session.last_prompt = ""
+
+
+def _decode_webm_to_frames(file_data: bytes, args) -> Optional[tuple]:
+    """Write a WebM blob to a temp file, decode to (frames, metadata), and
+    clean up. Returns (video_array, metadata) or (None, None) on failure.
+    Returns the sentinel ("too_small",) when the payload is clearly
+    truncated so the caller can log once and skip."""
+    MIN_WEBM_SIZE = 1000  # 1KB minimum for a valid EBML header
+    if len(file_data) < MIN_WEBM_SIZE:
+        print(f"⚠️ Video data too small ({len(file_data)} bytes < {MIN_WEBM_SIZE}), skipping corrupted/incomplete data")
+        return ("too_small",)
+
+    print("🎥 Processing video data...")
+    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
+        tmp.write(file_data)
+        input_path = tmp.name
+
+    try:
+        return downsample_video_to_numpy(input_path, target_fps=args.target_fps)
+    finally:
+        try:
+            os.remove(input_path)
+        except OSError:
+            pass
+
+
+def _maybe_launch_generation(session: StreamingSession, args):
+    """If we have enough accumulated frames (or a pending user prompt),
+    concatenate them, build sampling params, and launch the generation
+    background task. Clears accumulated frames once the task is scheduled."""
+    total_frames = sum(arr.shape[0] for arr in session.accumulated_video_frames)
+
+    should_process = False
+    # Priority trigger: pending user prompt.
+    if session.last_prompt and total_frames > 0:
+        print(f"⚡ Triggering immediate generation for user prompt (frames={total_frames})")
+        should_process = True
+    # Background trigger: have enough frames and the task is idle.
+    elif total_frames >= 2 and not session.is_generating:
+        print(f"⚡ Triggering background generation (frames={total_frames})")
+        should_process = True
+
+    if not should_process:
+        return
+    if session.is_generating:
+        if session.last_prompt:
+            print("⏳ Waiting for previous generation to finish before processing prompt...")
+        return
+
+    # Concatenate all accumulated frames.
+    all_frames = np.concatenate(session.accumulated_video_frames, axis=0)
+
+    # Qwen3-VL requires at least 2 frames (temporal_factor=2). Duplicate
+    # a single frame if necessary.
+    if all_frames.shape[0] == 1:
+        print(f"⚠️ Only 1 frame, duplicating to meet Qwen3-VL minimum requirement (2 frames)")
+        all_frames = np.concatenate([all_frames, all_frames], axis=0)
+
+    # Limit to max 16 frames to avoid OOM.
+    if all_frames.shape[0] > 16:
+        all_frames = all_frames[-16:]
+
+    video_metadata = {
+        "fps": args.target_fps,
+        "duration": all_frames.shape[0] / args.target_fps,
+        "total_num_frames": all_frames.shape[0],
+        "frames_indices": list(range(all_frames.shape[0])),
+        "video_backend": "opencv",
+        "do_sample_frames": False,
+    }
+    video_tuple = (all_frames, video_metadata)
+    session.accumulated_video_frames = []
+
+    # Mark as generating IMMEDIATELY to prevent double trigger.
+    session.is_generating = True
+
+    current_prompt = session.last_prompt
+    session.last_prompt = ""
+    session.is_auto_generating = (current_prompt == "")
+
+    penalty_kwargs = {}
+    if session.cross_turn_penalty is not None:
+        penalty_kwargs = session.cross_turn_penalty.build_sampling_kwargs()
+
+    sampling_params = SamplingParams(
+        temperature=args.temperature,
+        max_tokens=args.max_tokens,
+        **penalty_kwargs,
+    )
+
+    session.current_task = asyncio.create_task(generate_response_with_video(
+        session,
+        video_tuple,
+        current_prompt,
+        sampling_params,
+        args
+    ))
+
+
+def _handle_video_msg(file_data: bytes, session: StreamingSession, args):
+    """Decode a WebM chunk, accumulate frames on the session, and
+    opportunistically launch generation."""
+    result = _decode_webm_to_frames(file_data, args)
+    if result == ("too_small",):
+        return
+    video_array, _metadata = result
+    if video_array is None:
+        print("❌ Video processing failed - no frames extracted (possible codec incompatibility with iOS Chrome)")
+        return
+
+    session.accumulated_video_frames.append(video_array)
+    total_frames = sum(arr.shape[0] for arr in session.accumulated_video_frames)
+    print(f"📹 Got {video_array.shape[0]} frames, total accumulated: {total_frames}")
+
+    _maybe_launch_generation(session, args)
+
+
+async def _handle_audio_msg(file_data: bytes, session: StreamingSession, args):
+    """Persist audio, run ASR, and set session.last_prompt. If a previous
+    auto-generation is still running, cancel it so the user prompt can
+    take precedence."""
+    audio_path = os.path.join(AUDIO_DIR, "latest.mp3")
+    os.makedirs(AUDIO_DIR, exist_ok=True)
+    with open(audio_path, "wb") as f:
+        f.write(file_data)
+    print(f"🎤 Saved audio to {audio_path}")
+
+    _asr_start = time.time()
+    if args.asr_sync:
+        loop = asyncio.get_event_loop()
+        transcribed_text = await loop.run_in_executor(
+            None, get_audio_prompt, audio_path, args.asr_url
+        )
+    else:
+        transcribed_text = await transcribe_audio_async(audio_path, args.asr_url)
+    _asr_end = time.time()
+    print(f"⏱️ [TIMING] ASR latency: {(_asr_end - _asr_start)*1000:.1f}ms")
+
+    if not transcribed_text:
+        print("⚠ ASR returned empty, will use default prompt")
+        return
+
+    session.last_prompt = transcribed_text
+    print(f"📝 Set prompt from ASR: {session.last_prompt[:50]}...")
+
+    # Plan 2: ASR query is sent to client immediately; model inference
+    # result will be sent separately later.
+    send_asr_query(session, transcribed_text)
+
+    # Optimization: try to trigger immediately if we have any video frames.
+    if session.accumulated_video_frames:
+        print("🚀 Audio arrived, attempting immediate trigger...")
+        if session.is_generating and session.is_auto_generating:
+            if session.current_task and not session.current_task.done():
+                print("🛑 Interrupting auto-generation for user prompt (from Audio event)!")
+                session.current_task.cancel()
+
+
 async def handle_client_connection_async(conn, addr, args):
     """Handle client connection with async support."""
     print(f"================================================")
@@ -602,231 +818,40 @@ async def handle_client_connection_async(conn, addr, args):
     async with session_lock:
         streaming_sessions[session_id] = session
 
-    # Generation task tracking (not used for long-running loop anymore)
-    generation_task = None
-    accumulated_video_frames: list = []  # List of numpy arrays (each shape: num_frames, H, W, 3)
-    last_prompt = ""
-
     try:
         while True:
-            # Read header: [Type 1 byte] [Length 8 bytes] = 9 bytes total
-            try:
-                header = await asyncio.get_event_loop().run_in_executor(
-                    None, recv_exactly, conn, 9, 5.0
-                )
-            except TimeoutError:
-                # No data received, continue waiting
+            header_result = await _read_header(conn)
+            if header_result is None:
+                break
+            if header_result[0] == "timeout":
                 continue
-            except ConnectionError:
-                print("🔌 Client disconnected")
-                break
-            except OSError as e:
-                print(f"❌ Header read error: {e}")
-                break
-
-            file_type, file_len = struct.unpack(">BQ", header)
-            print(f"📩 Received: type={file_type}, length={file_len}, time={datetime.now().strftime('%H:%M:%S.%f')}")
+            file_type, file_len = header_result
 
             # Sanity check for length (prevent memory issues)
             if file_len > 100 * 1024 * 1024:  # 100MB max
                 print(f"⚠ Invalid length {file_len}, skipping message")
                 continue
 
-            # Read file content
-            try:
-                file_data = await asyncio.get_event_loop().run_in_executor(
-                    None, recv_exactly, conn, file_len, 30.0
-                )
-            except TimeoutError:
-                print(f"⚠ Timeout reading {file_len} bytes, skipping")
+            file_data = await _read_payload(conn, file_len)
+            if file_data is None:
+                break
+            if file_data == b"":
+                # Timeout on payload — skip, keep loop alive.
                 continue
-            except ConnectionError:
-                print("🔌 Client disconnected during data read")
-                break
-            except OSError as e:
-                print(f"❌ Data read error: {e}")
-                break
 
-            # Yield immediately so other tasks (e.g. generate() waiting for first token) can run.
-            # Avoids event loop starvation that causes ~800ms TTFT delay.
+            # Yield immediately so other tasks (e.g. generate() waiting for
+            # first token) can run. Avoids event loop starvation that causes
+            # ~800ms TTFT delay.
             await asyncio.sleep(0)
 
             if file_type == 1:  # Video (WebM)
-                # Sanity check: WebM files need a minimum size for valid EBML header
-                # A valid WebM file is typically at least 1KB even for short clips
-                MIN_WEBM_SIZE = 1000  # 1KB minimum
-                if len(file_data) < MIN_WEBM_SIZE:
-                    print(f"⚠️ Video data too small ({len(file_data)} bytes < {MIN_WEBM_SIZE}), skipping corrupted/incomplete data")
-                    continue
-
-                # Downsample video to target FPS and get as numpy array with metadata
-                print("🎥 Processing video data...")
-                with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
-                    tmp.write(file_data)
-                    input_path = tmp.name
-
-                try:
-                    video_array, metadata = downsample_video_to_numpy(input_path, target_fps=args.target_fps)
-                finally:
-                    try:
-                        os.remove(input_path)
-                    except OSError:
-                        pass
-
-                if video_array is not None:
-                    # Accumulate video frames (as numpy arrays)
-                    accumulated_video_frames.append(video_array)
-                    total_frames = sum(arr.shape[0] for arr in accumulated_video_frames)
-                    print(f"📹 Got {video_array.shape[0]} frames, total accumulated: {total_frames}")
-
-                    # Process when we have frames OR if we have a pending prompt
-                    should_process = False
-
-                    # Priority trigger: Pending user prompt
-                    if last_prompt and total_frames > 0:
-                        print(f"⚡ Triggering immediate generation for user prompt (frames={total_frames})")
-                        should_process = True
-                    # Background trigger: Have enough frames AND idle
-                    elif total_frames >= 2 and not session.is_generating:
-                        print(f"⚡ Triggering background generation (frames={total_frames})")
-                        should_process = True
-
-                    if should_process:
-                        if session.is_generating and last_prompt:
-                             print("⏳ Waiting for previous generation to finish before processing prompt...")
-                             pass
-
-                        if not session.is_generating:
-                            import numpy as np
-
-                            # Concatenate all accumulated frames
-                            all_frames = np.concatenate(accumulated_video_frames, axis=0)
-
-                            # Qwen3-VL requires at least 2 frames (temporal_factor=2)
-                            # If we only have 1 frame, duplicate it to meet the minimum requirement
-                            if all_frames.shape[0] == 1:
-                                print(f"⚠️ Only 1 frame, duplicating to meet Qwen3-VL minimum requirement (2 frames)")
-                                all_frames = np.concatenate([all_frames, all_frames], axis=0)
-
-                            # Limit to max 16 frames to avoid OOM
-                            if all_frames.shape[0] > 16:
-                                all_frames = all_frames[-16:]
-
-                            # Create metadata for the combined video
-                            video_metadata = {
-                                "fps": args.target_fps,
-                                "duration": all_frames.shape[0] / args.target_fps,
-                                "total_num_frames": all_frames.shape[0],
-                                "frames_indices": list(range(all_frames.shape[0])),
-                                "video_backend": "opencv",
-                                "do_sample_frames": False,
-                            }
-                            video_tuple = (all_frames, video_metadata)
-
-                            accumulated_video_frames = []
-
-                            # Mark as generating IMMEDIATELY to prevent double trigger
-                            session.is_generating = True
-
-                            # Default prompt if none
-                            current_prompt = last_prompt if last_prompt else ""
-                            last_prompt = ""  # Clear prompt after using
-
-                            # Track if this is an auto-generation (no user prompt)
-                            session.is_auto_generating = (current_prompt == "")
-
-                            penalty_kwargs = {}
-                            if session.cross_turn_penalty is not None:
-                                penalty_kwargs = session.cross_turn_penalty.build_sampling_kwargs()
-
-                            sampling_params = SamplingParams(
-                                temperature=args.temperature,
-                                max_tokens=args.max_tokens,
-                                **penalty_kwargs,
-                            )
-
-                            # Launch background task with video tuple
-                            session.current_task = asyncio.create_task(generate_response_with_video(
-                                session,
-                                video_tuple,
-                                current_prompt,
-                                sampling_params,
-                                args
-                            ))
-                else:
-                    print("❌ Video processing failed - no frames extracted (possible codec incompatibility with iOS Chrome)")
-
+                _handle_video_msg(file_data, session, args)
             elif file_type == 2:  # Audio
-                # Save audio for ASR
-                audio_path = os.path.join(AUDIO_DIR, "latest.mp3")
-                os.makedirs(AUDIO_DIR, exist_ok=True)
-                with open(audio_path, "wb") as f:
-                    f.write(file_data)
-                print(f"🎤 Saved audio to {audio_path}")
-
-                # Call ASR service to transcribe audio
-                _asr_start = time.time()
-                if args.asr_sync:
-                    # Synchronous version
-                    loop = asyncio.get_event_loop()
-                    transcribed_text = await loop.run_in_executor(
-                        None, get_audio_prompt, audio_path, args.asr_url
-                    )
-                else:
-                    # Asynchronous version (default)
-                    transcribed_text = await transcribe_audio_async(audio_path, args.asr_url)
-                _asr_end = time.time()
-                print(f"⏱️ [TIMING] ASR latency: {(_asr_end - _asr_start)*1000:.1f}ms")
-
-                if transcribed_text:
-                    last_prompt = transcribed_text
-                    print(f"📝 Set prompt from ASR: {last_prompt[:50]}...")
-
-                    # Plan 2: ASR query is sent to client immediately,
-                    # model inference result will be sent separately later.
-                    send_asr_query(session, transcribed_text)
-
-                    # Optimization: Try to trigger immediately if we have ANY video frames
-                    if accumulated_video_frames:
-                        print("🚀 Audio arrived, attempting immediate trigger...")
-                        if session.is_generating and session.is_auto_generating:
-                            if session.current_task and not session.current_task.done():
-                                print("🛑 Interrupting auto-generation for user prompt (from Audio event)!")
-                                session.current_task.cancel()
-                else:
-                    print("⚠ ASR returned empty, will use default prompt")
-
-                # Note: Generation is triggered by Video frame loop when frames arrive
-                # If frames are already there, we could trigger here, but to avoid race conditions
-                # we let the video loop handle it.
-
+                await _handle_audio_msg(file_data, session, args)
             elif file_type == 4:  # Clear Context
-                print("🗑 Clearing context...")
-                # Cancel any running generation task first
-                if session.current_task and not session.current_task.done():
-                    print("⏹ Cancelling running generation task...")
-                    session.current_task.cancel()
-                    session.is_generating = False
-                    session.is_auto_generating = False
-                session.history._reset()
-                if session.cross_turn_penalty is not None:
-                    session.cross_turn_penalty.reset()
-                accumulated_video_frames = []
-                last_prompt = ""
-
+                _reset_session_state(session, "🗑 Clearing context...")
             elif file_type == 6:  # Start Camera
-                print("📷 Camera started, resetting state...")
-                # Cancel any running generation task first
-                if session.current_task and not session.current_task.done():
-                    print("⏹ Cancelling running generation task...")
-                    session.current_task.cancel()
-                    session.is_generating = False
-                    session.is_auto_generating = False
-                session.history._reset()
-                if session.cross_turn_penalty is not None:
-                    session.cross_turn_penalty.reset()
-                accumulated_video_frames = []
-                last_prompt = ""
+                _reset_session_state(session, "📷 Camera started, resetting state...")
 
     except Exception as e:
         # Top-level catch for the per-connection handler: anything uncaught
@@ -838,8 +863,6 @@ async def handle_client_connection_async(conn, addr, args):
         print(f"👋 Connection closed by {addr}")
 
         # Cleanup
-        # No streaming input to stop
-
         async with session_lock:
             if session_id in streaming_sessions:
                 del streaming_sessions[session_id]

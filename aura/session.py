@@ -11,7 +11,7 @@ import asyncio
 import socket
 import threading
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, List, Optional
 
 from aura.session_history import SessionHistory
 from aura.cross_turn_penalty import CrossTurnPenalty
@@ -29,3 +29,10 @@ class StreamingSession:
     cross_turn_penalty: Optional[CrossTurnPenalty] = None
     conn: Optional[socket.socket] = None
     conn_lock: threading.Lock = field(default_factory=threading.Lock)
+
+    # Per-connection scratch state updated by the TCP handler as messages
+    # arrive. accumulated_video_frames holds unpacked numpy arrays waiting
+    # for a generation trigger; last_prompt is the most recent ASR result
+    # not yet consumed by a video-triggered generation.
+    accumulated_video_frames: List[Any] = field(default_factory=list)
+    last_prompt: str = ""
