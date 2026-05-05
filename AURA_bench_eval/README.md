@@ -2,6 +2,12 @@
 
 This directory contains the benchmark evaluation setup for AURA.
 
+> **⚠ Separate environment.** The packages listed in `AURA_bench_eval/requirements.txt`
+> (`torch==2.8.0`, `vllm==0.11.0`, `transformers==4.57.1`, ...) are **incompatible**
+> with the repo's top-level `requirements.txt` (`torch==2.10.0`, `vllm==0.17.1`,
+> `transformers==4.57.6`). Always create a dedicated virtualenv **inside
+> `AURA_bench_eval/`** before installing — never mix the two into one venv.
+
 ## Quick Install
 
 Run the following commands inside `AURA_bench_eval`:
@@ -9,10 +15,7 @@ Run the following commands inside `AURA_bench_eval`:
 ```bash
 uv venv --python 3.11 --seed
 source .venv/bin/activate
-uv pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0
-uv pip install vllm==0.11.0 --torch-backend=auto
-uv pip install transformers==4.57.1
-uv pip install ffmpeg-python==0.2.0
+uv pip install -r requirements.txt --torch-backend=auto
 ```
 
 ## Required Transformers Patch

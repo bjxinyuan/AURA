@@ -1,0 +1,22 @@
+# AURA_bench_eval dependencies.
+#
+# This is a SEPARATE environment from the repo's top-level requirements.txt.
+# Do NOT install these into the same virtualenv as the demo server —
+# torch/vllm/transformers versions are deliberately pinned to a different
+# compatibility matrix here for benchmark reproducibility.
+#
+# Create a dedicated venv inside AURA_bench_eval/ before installing:
+#
+#     uv venv --python 3.11 --seed
+#     source .venv/bin/activate
+#     uv pip install -r requirements.txt --torch-backend=auto
+#
+# After install, see README.md § "Required Transformers Patch" for two
+# one-line edits that must be applied to the installed transformers package.
+
+torch==2.8.0
+torchvision==0.23.0
+torchaudio==2.8.0
+vllm==0.11.0
+transformers==4.57.1
+ffmpeg-python==0.2.0

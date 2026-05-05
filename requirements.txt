@@ -1,3 +1,11 @@
+# Dependencies for the AURA demo server (main inference service, Flask
+# frontend, TTS/ASR helpers).
+#
+# NOTE: AURA_bench_eval/ has its own requirements.txt with DIFFERENT pins
+# (torch==2.8.0 / vllm==0.11.0 / transformers==4.57.1). Install that one
+# into a separate virtualenv inside AURA_bench_eval/ — the two are not
+# co-installable.
+
 accelerate==1.12.0
 aiofiles==25.1.0
 aiohappyeyeballs==2.6.1
