@@ -5,19 +5,17 @@ Realtime Video Audio Capture Client - Streaming Version
 
 Downstream messages from the main inference service are fanned out
 from a background TCP receive thread onto a multiplexed event_queue,
-and the browser subscribes via /api/events (SSE). Legacy Type 3/5
-full-response paths are still polled (/api/poll_response,
-/api/poll_tts_audio) to preserve back-compat.
+and the browser subscribes via /api/events (SSE).
 
 协议定义:
 - Type 1: VIDEO (C->S)
 - Type 2: AUDIO (C->S)
-- Type 3: RESPONSE - 完整文本响应 (S->C)
 - Type 4: CLEAR_CONTEXT (C->S)
-- Type 5: TTS_AUDIO (S->C) - 保留，Streaming 版本暂不使用
 - Type 6: START_CAMERA (C->S)
 - Type 7: ERROR (S->C) - 服务端错误
-- Type 8: STREAMING_TOKEN (S->C) - 流式 token (新增)
+- Type 8: STREAMING_TOKEN (S->C) - 流式 token
+- Type 9: TTS_AUDIO_CHUNK (S->C) - TTS 流式 PCM chunk
+- Type 10: ASR_QUERY_ECHO (S->C) - ASR 转写文字回显
 """
 
 import argparse
@@ -55,13 +53,11 @@ last_video_send_time = 0
 # 协议类型
 VIDEO_TYPE = b'\x01'
 AUDIO_TYPE = b'\x02'
-RESPONSE_TYPE = 3  # Integer for unpack check (完整文本响应)
 CLEAR_CONTEXT_TYPE = b'\x04'  # 清空上下文
-TTS_AUDIO_TYPE = 5  # Integer for unpack check (TTS 音频响应 - WAV)
 START_CAMERA_TYPE = b'\x06'  # 开启摄像头（清理文件夹）
 ERROR_TYPE = 7  # 服务器错误/拒绝消息
 STREAMING_TOKEN_TYPE = 8  # 流式 token
-TTS_AUDIO_CHUNK_TYPE = 9  # TTS 音频 chunk (Raw PCM int16) - Step 2 新增
+TTS_AUDIO_CHUNK_TYPE = 9  # TTS 音频 chunk (Raw PCM int16)
 ASR_QUERY_ECHO_TYPE = 10  # ASR query echo (Plan 2: 立即回传用户转写文字)
 
 # 全局socket连接
@@ -70,11 +66,6 @@ global_socket = None
 last_connect_attempt = 0
 connect_retry_interval = 5
 connection_error_logged = False
-
-# Legacy queues (Type 3 full-response and Type 5 complete-WAV TTS paths).
-# Still polled by /api/poll_response and /api/poll_tts_audio — see README.
-response_queue = queue.Queue()
-tts_audio_queue = queue.Queue()
 
 # Multiplexed event queue drained by /api/events (SSE). Each item is a
 # (kind, payload_dict) tuple. Kinds: "token", "chunk", "error", "close".
@@ -166,13 +157,7 @@ def receive_thread_func():
                     break
                 data += chunk
                 
-            if msg_type == RESPONSE_TYPE:
-                # 完整文本响应
-                text_response = data.decode('utf-8')
-                logger.info(f"📨 收到完整响应 (长度: {len(text_response)})")
-                response_queue.put(text_response)
-            
-            elif msg_type == ERROR_TYPE:
+            if msg_type == ERROR_TYPE:
                 # 服务器错误/拒绝消息
                 error_msg = data.decode('utf-8')
                 logger.warning(f"⚠️ 服务端错误: {error_msg}")
@@ -206,44 +191,7 @@ def receive_thread_func():
                     event_queue.put(("token", {"raw": token_data}))
                 except Exception as e:
                     logger.error(f"解析 ASR query echo 失败: {e}")
-            
-            elif msg_type == TTS_AUDIO_TYPE:
-                # 收到 TTS 音频数据 (句子级流式协议 - WAV)
-                try:
-                    response_id_len = data[0]
-                    response_id = data[1:1+response_id_len].decode('utf-8')
-                    # 解析句子序号 (2 bytes each, big-endian)
-                    offset = 1 + response_id_len
-                    sentence_idx, total_sentences = struct.unpack(">HH", data[offset:offset+4])
-                    audio_data = data[offset+4:]
-                    logger.info(f"🔊 收到 TTS 句 {sentence_idx + 1}/{total_sentences} (大小: {len(audio_data)} 字节)")
-                    tts_audio_queue.put({
-                        "response_id": response_id,
-                        "sentence_idx": sentence_idx,
-                        "total_sentences": total_sentences,
-                        "audio_data": audio_data
-                    })
-                except Exception as parse_e:
-                    logger.error(f"解析 TTS 音频协议失败: {parse_e}")
-                    # 兼容旧格式
-                    try:
-                        response_id_len = data[0]
-                        response_id = data[1:1+response_id_len].decode('utf-8')
-                        audio_data = data[1+response_id_len:]
-                        tts_audio_queue.put({
-                            "response_id": response_id,
-                            "sentence_idx": 0,
-                            "total_sentences": 1,
-                            "audio_data": audio_data
-                        })
-                    except:
-                        tts_audio_queue.put({
-                            "response_id": "",
-                            "sentence_idx": 0,
-                            "total_sentences": 1,
-                            "audio_data": data
-                        })
-            
+
             elif msg_type == TTS_AUDIO_CHUNK_TYPE:
                 # 收到 TTS 音频 chunk (Raw PCM int16) - Step 2 新增
                 # 协议: response_id_len(1) + response_id + sentence_idx(2) + chunk_idx(2) + sample_rate(4) + is_final(1) + pcm_data
@@ -389,63 +337,6 @@ def receive_audio():
         logger.error(f"处理音频失败: {e}")
         return jsonify({'success': False, 'error': str(e)})
 
-@app.route('/api/poll_response', methods=['GET'])
-def poll_response():
-    """轮询获取完整响应"""
-    session_id = request.args.get('session_id')
-    if not verify_session(session_id):
-        return get_session_error_response()
-    
-    try:
-        response = response_queue.get_nowait()
-        return jsonify({
-            'success': True,
-            'response': response
-        })
-    except queue.Empty:
-        return jsonify({
-            'success': False,
-            'response': None
-        })
-
-@app.route('/api/poll_tts_audio', methods=['GET'])
-def poll_tts_audio():
-    """轮询获取 TTS 音频"""
-    session_id = request.args.get('session_id')
-    if not verify_session(session_id):
-        return get_session_error_response()
-    
-    try:
-        tts_item = tts_audio_queue.get_nowait()
-        
-        response_id = tts_item.get("response_id", "")
-        sentence_idx = tts_item.get("sentence_idx", 0)
-        total_sentences = tts_item.get("total_sentences", 1)
-        audio_data = tts_item.get("audio_data", b"")
-        
-        content_type = 'audio/mpeg'
-        if audio_data[:4] == b'RIFF':
-            content_type = 'audio/wav'
-        
-        logger.info(f"🔊 返回 TTS 句 {sentence_idx + 1}/{total_sentences}")
-        
-        return Response(
-            audio_data,
-            mimetype=content_type,
-            headers={
-                'Content-Disposition': 'inline; filename="tts_audio.mp3"',
-                'X-Audio-Available': 'true',
-                'X-Response-Id': response_id,
-                'X-Sentence-Idx': str(sentence_idx),
-                'X-Total-Sentences': str(total_sentences)
-            }
-        )
-    except queue.Empty:
-        return jsonify({
-            'success': False,
-            'audio': None
-        })
-
 @app.route('/api/status', methods=['GET'])
 def get_status():
     """获取连接状态"""
@@ -487,10 +378,8 @@ def acquire_session():
             new_session_id = str(uuid.uuid4())[:8]
             current_user_session = new_session_id
             
-            # 清空残留的队列数据
-            global response_queue, tts_audio_queue, event_queue
-            response_queue = queue.Queue()
-            tts_audio_queue = queue.Queue()
+            # 清空残留的事件队列
+            global event_queue
             event_queue = queue.Queue()
 
             logger.info(f"✅ 用户获取会话锁: {new_session_id}，已清空残留队列")

@@ -380,18 +380,6 @@
             <div class="response-title">📨 服务端响应</div>
             <div id="responseContent" class="response-content"></div>
         </div>
-        <div id="ttsPlayerContainer" class="tts-player-container">
-            <div class="tts-player-header">
-                <div class="tts-player-title">
-                    🔊 语音回复
-                    <span id="speakerAnimation" class="speaker-animation" style="display: none;">
-                        <span class="wave"></span><span class="wave"></span><span class="wave"></span>
-                    </span>
-                </div>
-                <span id="ttsStatus" class="tts-status ready">准备就绪</span>
-            </div>
-            <audio id="ttsAudioPlayer" class="tts-audio-player" controls></audio>
-        </div>
         <div id="logContent" class="log-content"></div>
         <div id="audioDuration">0s</div>
         <div id="audioSize">0 KB</div>
@@ -404,18 +392,10 @@
         let audioContextUnlocked = false;
 
         // 解锁音频播放（解决浏览器自动播放限制）
+        // Web Audio API 也有自己的 unlockWebAudioContext，两者独立
         function unlockAudioContext() {
-            if (audioContextUnlocked || !ttsAudioPlayer) return;
-            
-            // 尝试播放并立即暂停，以获取播放权限
-            ttsAudioPlayer.play().then(() => {
-                ttsAudioPlayer.pause();
-                ttsAudioPlayer.currentTime = 0;
-                audioContextUnlocked = true;
-                console.log("🔊 Audio context unlocked for autoplay");
-            }).catch(e => {
-                console.log("🔊 Audio autoplay unlock failed (will retry):", e);
-            });
+            if (audioContextUnlocked) return;
+            audioContextUnlocked = true;
         }
 
         // 全局变量
@@ -432,19 +412,13 @@
         let audioCount = 0;
         let audioStartTime = null;
         let pollInterval = null;
-        let ttsAudioPollInterval = null;  // TTS 音频轮询定时器
         let currentStreamingBubble = null;  // 当前流式显示的气泡 (新增)
         let currentStreamingResponseId = null;  // 当前流式的 response_id (新增)
         const streamedResponseIds = new Set();  // 已通过流式显示的 response_id 集合（防止重复）
         let currentFacingMode = 'environment'; // 默认为后置摄像头
         let currentSessionId = null;  // 当前会话 ID（用于多用户锁）
-        let isTtsPlaying = false;  // TTS 是否正在播放
-        let ttsAudioQueue = [];  // TTS 音频队列（用于排队播放）
-        let currentDisplayedResponseId = null;  // 当前显示的文本 response_id（用于匹配音频）
-        let currentTtsResponseId = null;  // 当前正在播放的 TTS response_id（句子级流式）
+        let currentDisplayedResponseId = null;  // 当前显示的文本 response_id（用于匹配 WebAudio chunk）
         const canceledResponseIds = new Set();  // 已取消播放的 response_id 集合
-        let currentSentenceIdx = 0;  // 当前播放的句子序号
-        let totalSentences = 0;  // 当前响应的总句子数
         let videoMediaRecorder = null;  // 视频录制 MediaRecorder 实例
         let videoRecordTimeout = null;  // 视频录制超时定时器
         
@@ -479,12 +453,6 @@
         const sendingStatus = document.getElementById('sendingStatus');
         const responsePanel = document.getElementById('responsePanel');
         const responseContent = document.getElementById('responseContent');
-        
-        // TTS 相关 DOM 元素
-        const ttsPlayerContainer = document.getElementById('ttsPlayerContainer');
-        const ttsAudioPlayer = document.getElementById('ttsAudioPlayer');
-        const ttsStatus = document.getElementById('ttsStatus');
-        const speakerAnimation = document.getElementById('speakerAnimation');
         
         // 日志函数（限制最大条目数，防止内存泄漏）
         const MAX_LOG_ENTRIES = 100;  // 最多保留100条日志
@@ -697,18 +665,13 @@
                 clearTimeout(pollInterval);
                 pollInterval = null;
             }
-            
-            if (ttsAudioPollInterval) {
-                clearTimeout(ttsAudioPollInterval);
-                ttsAudioPollInterval = null;
-            }
-            
-            // 停止 TTS chunk 轮询 (Step 2)
+
+            // 停止 SSE 流 (token + TTS chunk + error)
             stopEventStream();
-            
+
             // 停止 TTS 音频
-            stopTtsAudio();
-            
+            stopAllWebAudioPlayback(true);
+
             videoPreview.srcObject = null;
             videoPreview.classList.remove('mirrored');
             
@@ -740,22 +703,17 @@
             
             // 隐藏响应面板
             responsePanel.classList.remove('visible');
-            responseCounter = 0;
-            
+
             // 清空浮动响应
             const floatingContainer = document.getElementById('floatingResponses');
             if (floatingContainer) {
                 floatingContainer.innerHTML = '';
             }
-            
+
             // 重置流式显示状态（防止内存泄漏）
             currentStreamingBubble = null;
             currentStreamingResponseId = null;
             currentDisplayedResponseId = null;
-            
-            // 清理去重集合
-            recentQueries.clear();
-            recentResponseTexts.clear();
             streamedResponseIds.clear();
             
             log('视频流已停止', 'warning');
@@ -769,9 +727,9 @@
         async function forceReleaseSession(showAlert = true) {
             try {
                 log('🔓 正在释放会话...', 'info');
-                
-                // 停止所有正在进行的播放和轮询
-                stopTtsAudio();
+
+                // 停止所有正在进行的播放和 SSE 流
+                stopAllWebAudioPlayback(true);
                 stopEventStream();
                 
                 const response = await fetch('/api/force_release_session', { method: 'POST' });
@@ -838,12 +796,9 @@
             // 启动 SSE 连接 (token + chunk + error 三合一)
             startEventStream();
 
-            // 启动 TTS 音频轮询 (Type 5 - WAV, legacy path)
-            startPollingTtsAudio();
-            
             // 再次尝试解锁音频（以防之前失败）
             unlockAudioContext();
-            
+
             // 解锁 Web Audio Context (Step 2)
             unlockWebAudioContext();
             
@@ -1024,7 +979,6 @@
             // 中断所有正在播放的 TTS 语音
             log('🔇 录音开始，中断 TTS 播放', 'info');
             stopAllWebAudioPlayback(true);  // 停止 Web Audio API 播放，并重置 response_id 防止后续 chunk 继续播放
-            stopTtsAudio();                 // 停止 HTML Audio 播放 (Type 5 WAV)
             
             // 检查浏览器是否支持必要的 API
             if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -1326,10 +1280,10 @@
         // 处理单个流式 token
         function handleStreamingToken(tokenData) {
             const { response_id, token, is_final, type, query, is_start, is_silent } = tokenData;
-            
+
             const floatingContainer = document.getElementById('floatingResponses');
             if (!floatingContainer) return;
-            
+
             // 辅助函数：创建聊天气泡
             function createChatBubble(text, bubbleType, icon) {
                 const bubble = document.createElement('div');
@@ -1337,40 +1291,22 @@
                 bubble.innerHTML = `<span class="bubble-icon">${icon}</span>${text}`;
                 return bubble;
             }
-            
-            // 辅助函数：设置气泡自动淡出
-            function setupBubbleFadeout(bubble) {
-                setTimeout(() => {
-                    if (bubble.parentNode) {
-                        bubble.classList.add('fading');
-                        setTimeout(() => {
-                            if (bubble.parentNode) bubble.remove();
-                        }, FLOATING_RESPONSE_FADE_DURATION);
-                    }
-                }, FLOATING_RESPONSE_DURATION);
-            }
-            
+
             // Plan 2: ASR query echo (Type 10) - 立即显示用户文字，不创建助手气泡
             if (type === 'asr_query') {
                 const q = tokenData.query;
                 if (q && q.trim()) {
                     const formattedQuery = q.replace(/\n/g, '<br>');
-                    if (!recentQueries.has(formattedQuery)) {
-                        recentQueries.add(formattedQuery);
-                        setTimeout(() => recentQueries.delete(formattedQuery), 5000);
-                        
-                        const userBubble = createChatBubble(formattedQuery, 'user', '🗣️');
-                        floatingContainer.appendChild(userBubble);
-                        setupBubbleFadeout(userBubble);
-                        floatingContainer.scrollTop = floatingContainer.scrollHeight;
-                        log(`🗣️ 用户: ${q.substring(0, 30)}...`, 'info');
-                    }
+                    const userBubble = createChatBubble(formattedQuery, 'user', '🗣️');
+                    floatingContainer.appendChild(userBubble);
+                    floatingContainer.scrollTop = floatingContainer.scrollHeight;
+                    log(`🗣️ 用户: ${q.substring(0, 30)}...`, 'info');
                 }
                 return;
             }
-            
+
             if (type !== 'streaming_token') return;
-            
+
             // 如果是 silent 响应，不显示任何内容，只重置状态
             if (is_silent) {
                 // 如果有正在显示的流式气泡，移除它
@@ -1381,45 +1317,38 @@
                 currentStreamingResponseId = null;
                 return;
             }
-            
+
             // 检查是否是新的响应
             if (currentStreamingResponseId !== response_id) {
                 // 新的响应开始，创建新的流式气泡
                 currentStreamingResponseId = response_id;
                 currentDisplayedResponseId = response_id; // 更新当前显示的响应 ID，用于 TTS 匹配
-                
+
                 // 如果有 query (ASR 结果)，先显示用户的消息（兼容旧协议）
                 if (is_start && query && query.trim()) {
                     const formattedQuery = query.replace(/\n/g, '<br>');
-                    // 去重检查
-                    if (!recentQueries.has(formattedQuery)) {
-                        recentQueries.add(formattedQuery);
-                        setTimeout(() => recentQueries.delete(formattedQuery), 5000);
-                        
-                        const userBubble = createChatBubble(formattedQuery, 'user', '🗣️');
-                        floatingContainer.appendChild(userBubble);
-                        setupBubbleFadeout(userBubble);
-                        log(`🗣️ 用户: ${query.substring(0, 30)}...`, 'info');
-                    }
+                    const userBubble = createChatBubble(formattedQuery, 'user', '🗣️');
+                    floatingContainer.appendChild(userBubble);
+                    log(`🗣️ 用户: ${query.substring(0, 30)}...`, 'info');
                 }
-                
+
                 // 创建流式显示气泡
                 currentStreamingBubble = document.createElement('div');
                 currentStreamingBubble.className = 'chat-bubble assistant streaming';
                 currentStreamingBubble.innerHTML = `<span class="bubble-icon">🤖</span><span class="streaming-content"></span><span class="streaming-cursor">▊</span>`;
                 floatingContainer.appendChild(currentStreamingBubble);
-                
+
                 // 滚动到底部
                 floatingContainer.scrollTop = floatingContainer.scrollHeight;
-                
+
                 log(`📝 开始流式输出 (id: ${response_id.substring(0, 8)}...)`, 'info');
             }
-            
+
             // 追加 token 到当前气泡
             if (currentStreamingBubble) {
                 const contentEl = currentStreamingBubble.querySelector('.streaming-content');
                 const cursorEl = currentStreamingBubble.querySelector('.streaming-cursor');
-                
+
                 if (contentEl && token) {
                     // 过滤掉 <|silent|> 等特殊标记
                     if (token.includes('<|silent|>') || token.includes('<|silent|')) {
@@ -1429,177 +1358,28 @@
                     const formattedToken = token.replace(/\n/g, '<br>');
                     contentEl.insertAdjacentHTML('beforeend', formattedToken);
                 }
-                
-                // 如果是最后一个 token，移除光标并设置淡出
+
+                // 如果是最后一个 token，移除光标
                 if (is_final) {
                     if (cursorEl) cursorEl.remove();
                     currentStreamingBubble.classList.remove('streaming');
-                    
-                    // 获取完整的流式内容（用于基于内容的去重）
-                    const finalContent = contentEl ? contentEl.innerHTML : '';
-                    if (finalContent) {
-                        recentResponseTexts.add(finalContent);
-                        setTimeout(() => recentResponseTexts.delete(finalContent), 10000);
-                    }
-                    
-                    // 设置自动淡出
-                    const bubble = currentStreamingBubble;
-                    setTimeout(() => {
-                        if (bubble.parentNode) {
-                            bubble.classList.add('fading');
-                            setTimeout(() => {
-                                if (bubble.parentNode) bubble.remove();
-                            }, FLOATING_RESPONSE_FADE_DURATION);
-                        }
-                    }, FLOATING_RESPONSE_DURATION);
-                    
+
                     log(`✅ 流式输出完成`, 'success');
-                    
-                    // 记录已流式显示的响应 ID（防止 showResponse 重复显示）
+
+                    // 记录已流式显示的响应 ID（防止重复）
                     streamedResponseIds.add(response_id);
-                    // 10秒后清理，防止集合无限增长（增加到10秒，确保覆盖网络延迟）
+                    // 10秒后清理，防止集合无限增长
                     setTimeout(() => streamedResponseIds.delete(response_id), 10000);
-                    
+
                     // 重置流式状态
                     currentStreamingBubble = null;
                     currentStreamingResponseId = null;
                 }
             }
-            
-            // 限制最大显示数量（更积极的清理，防止内存泄漏）
-            const maxBubbles = FLOATING_RESPONSE_MAX * 2;
-            const children = Array.from(floatingContainer.children);
-            // 只统计非 fading 的气泡
-            const activeBubbles = children.filter(b => !b.classList.contains('fading'));
-            
-            if (activeBubbles.length > maxBubbles) {
-                const toRemove = activeBubbles.length - maxBubbles;
-                let removedCount = 0;
-                for (const bubble of activeBubbles) {
-                    if (bubble !== currentStreamingBubble && removedCount < toRemove) {
-                        bubble.classList.add('fading');
-                        setTimeout(() => {
-                            if (bubble.parentNode) bubble.remove();
-                        }, FLOATING_RESPONSE_FADE_DURATION);
-                        removedCount++;
-                    }
-                }
-            }
         }
         
         // =============== 流式 Token 功能结束 ===============
-        
-        // =============== showResponse - 已废弃 ===============
-        // NOTE: 此函数已不再使用，所有响应通过流式 token (handleStreamingToken) 显示
-        // 保留函数签名以防万一有其他地方调用
-        function showResponse(response) {
-            // 已废弃 - 响应现在通过流式 token 显示
-            console.log('[DEPRECATED] showResponse called - response should come via streaming tokens');
-        }
-        /* 
-        function originalShowResponse(response) {
-            if (!response) {
-                console.log('showResponse called with empty response');
-                return;
-            }
-            
-            responseCounter++;
-            console.log(`showResponse called #${responseCounter}:`, response.substring(0, 50));
-            
-            // 尝试解析 JSON 响应
-            let queryText = "";
-            let responseText = response;
-            let responseId = null;
-            
-            try {
-                // 检查是否是 JSON 格式 {"response_id": "...", "query": "...", "response": "..."}
-                if (response.trim().startsWith('{') && response.includes('"response"')) {
-                    const data = JSON.parse(response);
-                    // 使用 !== undefined 检查，允许空字符串
-                    if (data.response !== undefined) {
-                        responseText = data.response;
-                    }
-                    if (data.query) {
-                        queryText = data.query;
-                    }
-                    if (data.response_id) {
-                        responseId = data.response_id;
-                        currentDisplayedResponseId = responseId;
-                        console.log(`记录 response_id: ${currentDisplayedResponseId}`);
-                    }
-                    
-                    // 如果 response 为空（无论有没有 query），跳过显示
-                    // 因为流式输出会单独处理，这里收到的空 response 只是 ASR 占位消息
-                    if (responseText === "") {
-                        console.log("跳过空响应消息 (response为空，query=" + queryText + ")");
-                        return;
-                    }
-                }
-            } catch (e) {
-                console.log("Response is not JSON or parse error:", e);
-            }
-            
-            // 格式化响应文本（保留换行）
-            const formattedResponse = responseText.replace(/\\n/g, '<br>').replace(/\n/g, '<br>');
-            const formattedQuery = queryText ? queryText.replace(/\\n/g, '<br>').replace(/\n/g, '<br>') : "";
-            
-            // 创建聊天气泡
-            const floatingContainer = document.getElementById('floatingResponses');
-            if (floatingContainer) {
-                // 辅助函数：创建聊天气泡
-                function createChatBubble(text, type, icon) {
-                    const bubble = document.createElement('div');
-                    bubble.className = `chat-bubble ${type}`;
-                    bubble.innerHTML = `<span class="bubble-icon">${icon}</span>${text}`;
-                    return bubble;
-                }
-                
-                // 辅助函数：设置气泡自动淡出
-                function setupBubbleFadeout(bubble) {
-                    setTimeout(() => {
-                        if (bubble.parentNode) {
-                            bubble.classList.add('fading');
-                            setTimeout(() => {
-                                if (bubble.parentNode) bubble.remove();
-                            }, FLOATING_RESPONSE_FADE_DURATION);
-                        }
-                    }, FLOATING_RESPONSE_DURATION);
-                }
-                
-                // 1. 先添加用户消息（左对齐）- 如果有
-                // 增加去重逻辑：如果最近显示过相同的查询，则跳过
-                if (formattedQuery && formattedQuery.trim() && !recentQueries.has(formattedQuery)) {
-                    recentQueries.add(formattedQuery);
-                    // 5秒后允许再次显示相同的查询（防止完全屏蔽）
-                    setTimeout(() => recentQueries.delete(formattedQuery), 5000);
-                    
-                    const userBubble = createChatBubble(formattedQuery, 'user', '🗣️');
-                    // 插入到当前流式气泡之前（如果有）
-                    if (currentStreamingBubble && currentStreamingBubble.parentNode === floatingContainer) {
-                        floatingContainer.insertBefore(userBubble, currentStreamingBubble);
-                    } else {
-                        floatingContainer.appendChild(userBubble);
-                    }
-                    setupBubbleFadeout(userBubble);
-                }
-                
-                // 2. 模型回复
-                // 仅使用流式输出，此处不再创建完整气泡，避免重复
-                /*
-                if (!isSameAsStreaming) {
-                    // 不是流式显示的（或者流式没生效），创建新的回复气泡
-                    const assistantBubble = createChatBubble(formattedResponse, 'assistant', '🤖');
-                    floatingContainer.appendChild(assistantBubble);
-                    setupBubbleFadeout(assistantBubble);
-                } else {
-                    console.log('跳过重复的 Assistant 气泡 (已流式显示)');
-                    // 确保流式气泡最终会淡出（双重保险）
-                    if (currentStreamingBubble) {
-                        setupBubbleFadeout(currentStreamingBubble);
-                    }
-                }
-                */
-        
+
         // =============== Web Audio API 流式 PCM 播放 (Step 2) ===============
         
         // 初始化 Web Audio API
@@ -1770,312 +1550,6 @@
         
         // =============== Web Audio API 结束 ===============
         
-        // =============== TTS 音频播放功能 ===============
-        
-        // 初始化 TTS 音频播放器事件
-        function initTtsPlayer() {
-            if (!ttsAudioPlayer) return;
-            
-            // 播放开始
-            ttsAudioPlayer.addEventListener('play', () => {
-                isTtsPlaying = true;
-                // 显示句子进度
-                if (totalSentences > 1) {
-                    ttsStatus.textContent = `播放中 ${currentSentenceIdx + 1}/${totalSentences}`;
-                } else {
-                    ttsStatus.textContent = '正在播放';
-                }
-                ttsStatus.className = 'tts-status playing';
-                speakerAnimation.style.display = 'inline-flex';
-                
-                // 显示浮动 TTS 指示器
-                const floatingTts = document.getElementById('floatingTtsIndicator');
-                if (floatingTts) floatingTts.classList.add('visible');
-                
-                log(`🔊 TTS 句 ${currentSentenceIdx + 1}/${totalSentences} 开始播放`, 'info');
-            });
-            
-            // 播放结束
-            ttsAudioPlayer.addEventListener('ended', () => {
-                isTtsPlaying = false;
-                
-                // 清理当前 Blob URL
-                if (ttsAudioPlayer.src) {
-                    try {
-                        const oldSrc = ttsAudioPlayer.src;
-                        // 使用更加稳健的方式清理，并标记为"故意清理"以避免触发错误日志
-                        ttsAudioPlayer.dataset.clearing = 'true';
-                        ttsAudioPlayer.removeAttribute('src');
-                        ttsAudioPlayer.load(); // 强制触发资源释放
-                        URL.revokeObjectURL(oldSrc);
-                        setTimeout(() => { delete ttsAudioPlayer.dataset.clearing; }, 100);
-                    } catch (e) {
-                        console.error("Revoke URL failed:", e);
-                    }
-                }
-                
-                // 检查是否还有更多句子要播放
-                if (ttsAudioQueue.length > 0) {
-                    ttsStatus.textContent = `句 ${currentSentenceIdx + 1}/${totalSentences} 完成，继续下一句...`;
-                    log(`🔊 句 ${currentSentenceIdx + 1}/${totalSentences} 播放完成，队列剩余: ${ttsAudioQueue.length}`, 'success');
-                } else {
-                    ttsStatus.textContent = '播放完成';
-                    log(`🔊 TTS 全部 ${totalSentences} 句播放完成`, 'success');
-                    
-                    // 隐藏浮动 TTS 指示器（全部播放完成）
-                    const floatingTts = document.getElementById('floatingTtsIndicator');
-                    if (floatingTts) floatingTts.classList.remove('visible');
-                }
-                ttsStatus.className = 'tts-status ready';
-                speakerAnimation.style.display = 'none';
-                
-                // 如果队列中还有音频，继续播放
-                playNextTtsAudio();
-            });
-            
-            // 播放暂停
-            ttsAudioPlayer.addEventListener('pause', () => {
-                if (!ttsAudioPlayer.ended && !ttsAudioPlayer.dataset.clearing) {
-                    if (totalSentences > 1) {
-                        ttsStatus.textContent = `已暂停 ${currentSentenceIdx + 1}/${totalSentences}`;
-                    } else {
-                        ttsStatus.textContent = '已暂停';
-                    }
-                    ttsStatus.className = 'tts-status ready';
-                    speakerAnimation.style.display = 'none';
-                }
-            });
-            
-            // 播放错误
-            ttsAudioPlayer.addEventListener('error', (e) => {
-                // 如果是正在故意清理 src，或者是空 src，则忽略错误
-                if (ttsAudioPlayer.dataset.clearing || !ttsAudioPlayer.src || ttsAudioPlayer.src === window.location.href) {
-                    return;
-                }
-
-                isTtsPlaying = false;
-                ttsStatus.textContent = '播放失败';
-                ttsStatus.className = 'tts-status ready';
-                speakerAnimation.style.display = 'none';
-                log(`🔊 TTS 句 ${currentSentenceIdx + 1}/${totalSentences} 播放错误: ${e.message || '未知错误'}`, 'error');
-                
-                // 尝试播放队列中的下一个
-                playNextTtsAudio();
-            });
-        }
-        
-        // 播放 TTS 音频（句子级流式：同一 response_id 排队播放，新 response_id 清空旧队列）
-        async function playTtsAudio(audioBlob, responseId, sentenceIdx, totalSents) {
-            if (!ttsAudioPlayer) return;
-            
-            // 检查是否是被取消的响应
-            if (canceledResponseIds.has(responseId)) {
-                return;
-            }
-            
-            // 录音期间不播放任何 TTS
-            if (isAudioRecording) {
-                return;
-            }
-            
-            // 检查是否是新的响应（不同的 response_id）
-            if (currentTtsResponseId !== null && responseId !== currentTtsResponseId) {
-                // 新的响应到来，清空旧队列并停止当前播放
-                log(`🔊 新响应到来，清空旧队列 (old=${currentTtsResponseId}, new=${responseId})`, 'info');
-                
-            if (isTtsPlaying) {
-                ttsAudioPlayer.pause();
-                if (ttsAudioPlayer.src) {
-                    const oldSrc = ttsAudioPlayer.src;
-                    ttsAudioPlayer.dataset.clearing = 'true';
-                    ttsAudioPlayer.removeAttribute('src');
-                    ttsAudioPlayer.load();
-                    URL.revokeObjectURL(oldSrc);
-                    setTimeout(() => { delete ttsAudioPlayer.dataset.clearing; }, 100);
-                }
-                isTtsPlaying = false;
-            }
-            
-            // 清空队列中旧的 blob URLs 并释放内存
-            while (ttsAudioQueue.length > 0) {
-                const item = ttsAudioQueue.shift();
-                if (item && item.url) {
-                    URL.revokeObjectURL(item.url);
-                }
-            }
-        }
-        
-        // 更新当前响应信息
-        currentTtsResponseId = responseId;
-        totalSentences = totalSents;
-        
-        // 创建 Blob URL 并加入队列
-        const audioUrl = URL.createObjectURL(audioBlob);
-        const audioItem = {
-            url: audioUrl,
-            responseId: responseId,
-            sentenceIdx: sentenceIdx,
-            totalSents: totalSents
-        };
-        
-        // 如果当前没有播放，直接播放
-        if (!isTtsPlaying) {
-            await playAudioItem(audioItem);
-        } else {
-            // 否则加入队列
-            ttsAudioQueue.push(audioItem);
-            log(`🔊 句 ${sentenceIdx + 1}/${totalSents} 加入队列 (队列长度: ${ttsAudioQueue.length})`, 'info');
-        }
-    }
-        
-        // 播放单个音频项
-        async function playAudioItem(audioItem) {
-            if (!ttsAudioPlayer || !audioItem) return;
-            
-            try {
-                // 设置音频源
-                ttsAudioPlayer.src = audioItem.url;
-                currentSentenceIdx = audioItem.sentenceIdx;
-                
-                // 显示播放器
-                ttsPlayerContainer.classList.add('visible');
-                ttsStatus.textContent = `播放中 ${audioItem.sentenceIdx + 1}/${audioItem.totalSents}`;
-                ttsStatus.className = 'tts-status playing';
-                
-                // 自动播放
-                try {
-                    await ttsAudioPlayer.play();
-                } catch (playError) {
-                    // 自动播放可能被浏览器阻止
-                    log('⚠️ 自动播放被阻止，请点击播放按钮', 'warning');
-                    ttsStatus.textContent = `点击播放 ${audioItem.sentenceIdx + 1}/${audioItem.totalSents}`;
-                }
-                
-            } catch (error) {
-                log(`🔊 TTS 音频加载失败: ${error.message}`, 'error');
-                // 尝试播放下一个
-                playNextTtsAudio();
-            }
-        }
-        
-        // 播放队列中的下一个 TTS 音频
-        function playNextTtsAudio() {
-            if (ttsAudioQueue.length > 0) {
-                const nextAudio = ttsAudioQueue.shift();
-                playAudioItem(nextAudio);
-            } else {
-                // 队列为空，重置状态
-                currentTtsResponseId = null;
-                currentSentenceIdx = 0;
-                totalSentences = 0;
-            }
-        }
-        
-        // 开始轮询 TTS 音频
-        let isPollingTtsAudio = false;
-        async function pollTtsAudio() {
-            if (!isVideoStreaming) {
-                ttsAudioPollInterval = null;
-                return;
-            }
-            if (isPollingTtsAudio) return;
-
-            isPollingTtsAudio = true;
-            try {
-                const response = await fetch(`/api/poll_tts_audio?session_id=${encodeURIComponent(currentSessionId || '')}`);
-                
-                // 检查是否有音频数据
-                const audioAvailable = response.headers.get('X-Audio-Available');
-                
-                if (audioAvailable === 'true') {
-                    // 获取 response_id 和句子信息
-                    const audioResponseId = response.headers.get('X-Response-Id') || '';
-                    const sentenceIdx = parseInt(response.headers.get('X-Sentence-Idx') || '0', 10);
-                    const totalSents = parseInt(response.headers.get('X-Total-Sentences') || '1', 10);
-                    
-                    // 检查是否是被取消的响应
-                    if (canceledResponseIds.has(audioResponseId)) {
-                        log(`⏭ 忽略已取消的 TTS 句 ${sentenceIdx + 1}/${totalSents} (audio_id=${audioResponseId})`, 'warning');
-                        // 消耗掉 blob
-                        await response.blob();
-                        return;
-                    }
-
-                    // 获取音频 Blob
-                    const audioBlob = await response.blob();
-                    
-                    if (audioBlob.size > 0) {
-                        // 智能匹配：只播放与当前显示文本匹配的音频
-                        if (audioResponseId && currentDisplayedResponseId && 
-                            audioResponseId !== currentDisplayedResponseId) {
-                            log(`⏭ 丢弃过时 TTS 句 ${sentenceIdx + 1}/${totalSents} (audio_id=${audioResponseId})`, 'warning');
-                            // 注意：Blob 对象本身会被 GC，但如果响应对象未被正确清理可能有问题
-                        } else {
-                            log(`🔊 收到 TTS 句 ${sentenceIdx + 1}/${totalSents} (${(audioBlob.size / 1024).toFixed(1)} KB)`, 'success');
-                            playTtsAudio(audioBlob, audioResponseId, sentenceIdx, totalSents);
-                        }
-                    }
-                }
-            } catch (e) {
-                console.error("TTS audio polling error:", e);
-            } finally {
-                isPollingTtsAudio = false;
-                if (isVideoStreaming) {
-                    ttsAudioPollInterval = setTimeout(pollTtsAudio, 500);
-                }
-            }
-        }
-
-        function startPollingTtsAudio() {
-            if (ttsAudioPollInterval) clearTimeout(ttsAudioPollInterval);
-            ttsAudioPollInterval = setTimeout(pollTtsAudio, 500);
-        }
-        
-        // 停止 TTS 音频轮询和播放
-        function stopTtsAudio() {
-            if (ttsAudioPollInterval) {
-                clearTimeout(ttsAudioPollInterval);
-                ttsAudioPollInterval = null;
-            }
-            
-            // 停止当前播放
-            if (ttsAudioPlayer) {
-                ttsAudioPlayer.pause();
-                if (ttsAudioPlayer.src) {
-                    const oldSrc = ttsAudioPlayer.src;
-                    ttsAudioPlayer.dataset.clearing = 'true';
-                    ttsAudioPlayer.removeAttribute('src');
-                    ttsAudioPlayer.load();
-                    URL.revokeObjectURL(oldSrc);
-                    setTimeout(() => { delete ttsAudioPlayer.dataset.clearing; }, 100);
-                }
-            }
-            
-            // 清空队列中的 blob URLs 并释放内存
-            while (ttsAudioQueue.length > 0) {
-                const item = ttsAudioQueue.shift();
-                if (item && item.url) {
-                    URL.revokeObjectURL(item.url);
-                }
-            }
-            isTtsPlaying = false;
-            
-            // 重置句子级流式状态
-            if (currentTtsResponseId) {
-                canceledResponseIds.add(currentTtsResponseId);
-                log(`🚫 已取消 TTS 响应: ${currentTtsResponseId}`, 'warning');
-            }
-            currentTtsResponseId = null;
-            currentSentenceIdx = 0;
-            totalSentences = 0;
-            
-            // 隐藏播放器
-            if (ttsPlayerContainer) {
-                ttsPlayerContainer.classList.remove('visible');
-            }
-        }
-        
-        // =============== TTS 功能结束 ===============
         
         // 页面加载完成
         window.onload = function() {
@@ -2083,14 +1557,11 @@
             log('点击 Start 开始视频流传输', 'info');
             log('按住 Record 进行语音录制', 'info');
             log('📝 流式 Token 输出已启用', 'info');
-            
-            // 初始化 TTS 播放器
-            initTtsPlayer();
-            log('🔊 TTS 语音播放功能已启用', 'info');
-            
+            log('🔊 Web Audio API 流式 PCM 播放已启用', 'info');
+
             // 初始化录音按钮事件（避免内联事件导致的问题）
             initMicButton();
-            
+
             // 添加页面点击事件来解锁音频（作为备选方案）
             document.addEventListener('click', unlockAudioContext, { once: true });
             document.addEventListener('touchstart', unlockAudioContext, { once: true });
@@ -2178,7 +1649,7 @@
         
         // 页面关闭前清理
         window.onbeforeunload = function() {
-            stopTtsAudio();
+            stopAllWebAudioPlayback(true);
             if (videoStream) {
                 videoStream.getTracks().forEach(track => track.stop());
             }
