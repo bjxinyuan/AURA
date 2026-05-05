@@ -167,6 +167,6 @@ def downsample_video_to_numpy(
 
         return video_array, metadata
 
-    except Exception as e:
+    except (cv2.error, OSError) as e:
         print(f"❌ Error downsampling video: {e}")
         return None, None

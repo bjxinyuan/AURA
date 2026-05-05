@@ -203,7 +203,7 @@ def get_audio_prompt(audio_path: str, asr_url: str) -> str:
     except requests.exceptions.Timeout:
         print("❌ ASR request timeout")
         return ""
-    except Exception as e:
+    except requests.RequestException as e:
         print(f"❌ ASR error: {e}")
         return ""
 
@@ -244,7 +244,7 @@ async def transcribe_audio_async(audio_path: str, asr_url: str) -> str:
     except asyncio.TimeoutError:
         print("❌ [Async] ASR request timeout")
         return ""
-    except Exception as e:
+    except aiohttp.ClientError as e:
         print(f"❌ [Async] ASR error: {e}")
         return ""
 
@@ -325,7 +325,7 @@ async def init_async_engine(args) -> AsyncLLM:
                 f.write(f"{token_id:>8} | {token_str:<40} | {repr(token_str)}\n")
 
         print(f"📝 Vocabulary saved to {vocab_log_path} ({len(vocab)} tokens)")
-    except Exception as e:
+    except OSError as e:
         print(f"⚠️ Failed to save vocabulary: {e}")
     # ========== END DEBUG ==========
 
@@ -525,6 +525,9 @@ async def generate_response_with_video(
         if streaming_started and request_id:
             send_streaming_token(session, "", request_id, is_final=True)
     except Exception as e:
+        # Top-level catch for the async generation task: any uncaught exception
+        # here would otherwise silently kill the asyncio task and strand the
+        # client waiting for a final token. Keep broad; log stack for diagnosis.
         print(f"❌ [Session {session.session_id}] Generation error: {e}")
         import traceback
         traceback.print_exc()
@@ -623,7 +626,7 @@ async def handle_client_connection_async(conn, addr, args):
             except ConnectionError:
                 print("🔌 Client disconnected")
                 break
-            except Exception as e:
+            except OSError as e:
                 print(f"❌ Header read error: {e}")
                 break
 
@@ -646,7 +649,7 @@ async def handle_client_connection_async(conn, addr, args):
             except ConnectionError:
                 print("🔌 Client disconnected during data read")
                 break
-            except Exception as e:
+            except OSError as e:
                 print(f"❌ Data read error: {e}")
                 break
 
@@ -832,6 +835,8 @@ async def handle_client_connection_async(conn, addr, args):
                 last_prompt = ""
 
     except Exception as e:
+        # Top-level catch for the per-connection handler: anything uncaught
+        # would drop the connection without a clean finally; keep broad.
         print(f"❌ Connection error: {e}")
         import traceback
         traceback.print_exc()
@@ -1008,7 +1013,7 @@ async def main_async(args):
             with open(args.debug_context_file, "w", encoding="utf-8") as f:
                 pass
             print(f"🗑 [Debug] Cleared context file on server start: {args.debug_context_file}")
-        except Exception as e:
+        except OSError as e:
             print(f"⚠️ [Debug] Failed to clear context file: {e}")
 
     # 根据 model path 动态设置 SILENT_TOKEN_ID

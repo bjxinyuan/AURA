@@ -50,26 +50,22 @@ def send_streaming_token(session, token: str, response_id: str, is_final: bool =
     """
     if session.conn is None:
         return
-    try:
-        response_data = {
-            "response_id": response_id,
-            "token": token,
-            "is_final": is_final,
-            "type": "streaming_token"
-        }
-        if is_start:
-            response_data["is_start"] = True
-        if query:
-            response_data["query"] = query
+    response_data = {
+        "response_id": response_id,
+        "token": token,
+        "is_final": is_final,
+        "type": "streaming_token"
+    }
+    if is_start:
+        response_data["is_start"] = True
+    if query:
+        response_data["query"] = query
 
-        # Mark silent responses so client can handle them appropriately
-        if is_silent:
-            response_data["is_silent"] = True
+    # Mark silent responses so client can handle them appropriately
+    if is_silent:
+        response_data["is_silent"] = True
 
-        payload = json.dumps(response_data, ensure_ascii=False).encode('utf-8')
-    except Exception as e:
-        print(f"Error sending streaming token: {e}")
-        return
+    payload = json.dumps(response_data, ensure_ascii=False).encode('utf-8')
     _send(session, STREAMING_TOKEN_TYPE, payload)
 
 
@@ -83,15 +79,11 @@ def send_asr_query(session, query: str):
     """
     if session.conn is None:
         return
-    try:
-        response_data = {
-            "type": "asr_query",
-            "query": query,
-        }
-        payload = json.dumps(response_data, ensure_ascii=False).encode('utf-8')
-    except Exception as e:
-        print(f"Error sending ASR query to client: {e}")
-        return
+    response_data = {
+        "type": "asr_query",
+        "query": query,
+    }
+    payload = json.dumps(response_data, ensure_ascii=False).encode('utf-8')
     if _send(session, ASR_QUERY_ECHO_TYPE, payload):
         print(f"📤 [Plan2] Sent ASR query to client immediately: {query[:50]}...")
 
@@ -104,20 +96,16 @@ def send_audio(session, audio_bytes: bytes, response_id: str = None,
     """
     if session.conn is None:
         return
-    try:
-        response_id_bytes = (response_id or "").encode('utf-8')
-        response_id_len = len(response_id_bytes)
+    response_id_bytes = (response_id or "").encode('utf-8')
+    response_id_len = len(response_id_bytes)
 
-        # Protocol: Type 5 | length | response_id_len | response_id | sentence_idx | total_sentences | audio_data
-        payload = (
-            struct.pack(">B", response_id_len) +
-            response_id_bytes +
-            struct.pack(">HH", sentence_idx, total_sentences) +
-            audio_bytes
-        )
-    except Exception as e:
-        print(f"Error sending audio: {e}")
-        return
+    # Protocol: Type 5 | length | response_id_len | response_id | sentence_idx | total_sentences | audio_data
+    payload = (
+        struct.pack(">B", response_id_len) +
+        response_id_bytes +
+        struct.pack(">HH", sentence_idx, total_sentences) +
+        audio_bytes
+    )
     if _send(session, TTS_AUDIO_TYPE, payload):
         print(f"🔊 Sent TTS sentence {sentence_idx + 1}/{total_sentences} ({len(audio_bytes)} bytes)")
 
@@ -143,19 +131,15 @@ def send_audio_chunk(session, pcm_bytes: bytes, response_id: str,
     """
     if session.conn is None:
         return
-    try:
-        response_id_bytes = (response_id or "").encode('utf-8')
-        response_id_len = len(response_id_bytes)
+    response_id_bytes = (response_id or "").encode('utf-8')
+    response_id_len = len(response_id_bytes)
 
-        payload = (
-            struct.pack(">B", response_id_len) +
-            response_id_bytes +
-            struct.pack(">HHIB", sentence_idx, chunk_idx, sample_rate, 1 if is_final else 0) +
-            pcm_bytes
-        )
-    except Exception as e:
-        print(f"Error sending audio chunk: {e}")
-        return
+    payload = (
+        struct.pack(">B", response_id_len) +
+        response_id_bytes +
+        struct.pack(">HHIB", sentence_idx, chunk_idx, sample_rate, 1 if is_final else 0) +
+        pcm_bytes
+    )
     if _send(session, TTS_AUDIO_CHUNK_TYPE, payload):
         if is_final:
             print(f"🔊 [Chunk] Sent final chunk for sentence {sentence_idx} (chunk {chunk_idx})")

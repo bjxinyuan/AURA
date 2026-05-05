@@ -144,7 +144,7 @@ class SessionHistory:
                 f.write(json.dumps(record, ensure_ascii=False, default=_json_default) + "\n")
             print(f"📝 [Debug] Structured context saved to {self.debug_context_file} "
                   f"(request_id={request_id}, round={self.current_rounds})")
-        except Exception as e:
+        except (OSError, TypeError) as e:
             print(f"⚠️ [Debug] Failed to save context: {e}")
 
     def _has_user_text(self, user_msg) -> bool:

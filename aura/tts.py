@@ -118,9 +118,10 @@ def _text_to_speech_generator(service_url: str,
                 buf = buf[8 + pcm_len :]
                 yield pcm_data, sr
 
-    except Exception as e:
+    except requests.RequestException as e:
         print(f"TTS remote call error: {e}")
-        traceback.print_exc()
+    except struct.error as e:
+        print(f"TTS stream parse error (malformed chunk): {e}")
 
 
 # ---------------------------------------------------------------
@@ -187,7 +188,7 @@ class TTSController:
             self.streaming = True
             self.enabled = True
             return True
-        except Exception as e:
+        except requests.RequestException as e:
             print(f"⚠️ TTS service unreachable ({self.service_url}): {e}")
             self.enabled = False
             return False
@@ -310,7 +311,7 @@ class TTSController:
             try:
                 with open(self._latency_log_path, "a", encoding="utf-8") as f:
                     f.write(log_entry)
-            except Exception as e:
+            except OSError as e:
                 print(f"⚠️ Failed to write TTS latency log: {e}")
 
         print(f"📊 [TTS Latency] first_chunk={first_chunk_latency*1000:.1f}ms, "
@@ -331,7 +332,8 @@ class TTSController:
             resp = requests.get(f"{self.service_url}/v1/tts/health", timeout=5)
             if resp.ok:
                 model_type = resp.json().get("model_type", "base")
-        except Exception:
+        except (requests.RequestException, ValueError):
+            # ValueError covers JSONDecodeError when the service returns non-JSON
             pass
 
         use_chunk_streaming = (model_type == "base")
@@ -486,5 +488,8 @@ class TTSController:
                     self._current_response_id = None
 
             except Exception as e:
+                # Worker-thread top-level catch: a narrow except would risk
+                # killing the thread and silently stopping all TTS output.
+                # Keep broad; log stack for diagnosis.
                 print(f"TTS Worker error: {e}")
                 traceback.print_exc()
