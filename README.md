@@ -294,16 +294,19 @@ Open: `http://localhost:5003`
 
 ### Key Configuration
 
-Main inference parameters in `Qwen3_VL_online_streaming_v2_CM.sh`:
+Main inference parameters as passed by `Qwen3_VL_online_streaming_v2_CM.sh`.
+These are the values shipped in the launch script — the argparse defaults
+in `Qwen3_VL_online_streaming_v2_ContextManaged.py` are more conservative
+and are overridden here.
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
+| Parameter | Script value | Description |
+|-----------|-------------|-------------|
 | `--max-model-len` | 262144 | Maximum context length (256K tokens) |
 | `--temperature` | 0.5 | Sampling temperature |
 | `--max-tokens` | 128 | Max tokens per response |
 | `--cross-turn-penalty` | 1 | Cross-turn repetition penalty strength |
 | `--cross-turn-lookback` | 10 | Number of recent turns to penalize |
-| `--enable-pruning` | — | Enable sliding-window context pruning |
+| `--enable-pruning` | on | Enable sliding-window context pruning |
 | `--max-rounds` | 45 | Trigger pruning when rounds exceed this |
 | `--num-rounds-keep` | 30 | Rounds to keep after pruning |
 | `--kv-offloading-size` | 10 | KV cache CPU offload size (GB) |
@@ -311,18 +314,65 @@ Main inference parameters in `Qwen3_VL_online_streaming_v2_CM.sh`:
 ### Project Structure
 
 ```
+.
 ├── .env.example                              # Configuration template (ports, model path)
-├── start_all.sh                              # One-click launch script
-├── Qwen3_VL_online_streaming_v2_CM.sh        # Main inference launch script
-├── Qwen3_VL_online_streaming_v2_ContextManaged.py  # Core: vLLM engine + context management + TCP server
-├── Qwen3_asr_serve.py                        # ASR service (FastAPI + Qwen3-ASR)
+├── start_all.sh                              # One-click launch script for ASR + TTS + inference
+├── Qwen3_VL_online_streaming_v2_CM.sh        # Main inference launch script (argparse wiring)
+├── Qwen3_VL_online_streaming_v2_ContextManaged.py  # Core: vLLM engine driver + TCP server
+├── Qwen3_asr_serve.py / asr_serve.sh         # ASR service (FastAPI + Qwen3-ASR)
 ├── tts_service.py / tts_service.sh           # TTS service (streaming synthesis)
-├── realtime_capture_video_audio_streaming.py  # Web frontend middleware (Flask)
-├── templates/index_streaming.html            # Browser UI (main interface)
-├── requirements.txt                          # Python dependencies
+├── realtime_capture_video_audio_streaming.py # Flask bridge between browser and inference (SSE + TCP)
+│
+├── aura/                                     # Extracted modules (all unit-tested)
+│   ├── protocol.py                           #   Wire format: 9-byte header + message types
+│   ├── server_io.py                          #   Outbound token / audio-chunk / ASR-echo senders
+│   ├── session.py                            #   StreamingSession dataclass (per-connection state)
+│   ├── session_history.py                    #   Sliding-window chat history with pruning
+│   ├── cross_turn_penalty.py                 #   n-gram penalty + logit bias against prior turns
+│   ├── media.py                              #   WebM → numpy video frame decoding
+│   ├── tts.py                                #   TTSController: sentence queue + worker thread
+│   ├── sse.py                                #   Server-Sent Events framing for /api/events
+│   └── text_utils.py                         #   remove_markdown() for TTS-safe text
+│
+├── templates/index_streaming.html            # Browser UI (layout + CSS + <script src>)
+├── static/                                   # Frontend JS modules, loaded by index_streaming.html
+│   ├── state.js                              #   Shared globals + APP_CONFIG reader + DOM refs
+│   ├── ui.js                                 #   log(), updateStats()
+│   ├── playback.js                           #   Web Audio API streaming PCM
+│   ├── sse.js                                #   /api/events subscription + streaming-token handler
+│   ├── video.js                              #   Camera capture + MediaRecorder + frame send
+│   ├── session.js                            #   /api/force_release_session
+│   ├── audio.js                              #   Mic capture + audio send + mic button wiring
+│   └── main.js                               #   onload + audio unlock
+│
+├── tests/                                    # 134 pytest cases (pure unit tests, no GPU needed)
+│   ├── test_protocol.py / test_session.py / test_text_utils.py
+│   ├── test_session_history.py / test_cross_turn_penalty.py
+│   ├── test_media.py / test_server_io.py / test_sse.py / test_tts.py
+│   └── conftest.py
+│
+├── requirements.txt                          # Python dependencies for the demo server
+├── AURA_bench_eval/                          # Benchmark evaluation (separate env — see below)
 ├── shuhan.mp3                                # TTS reference audio for voice cloning
-└── Qwen3-TTS-streaming/                      # TTS model inference library
+└── Qwen3-TTS-streaming/                      # Vendored TTS model inference library
 ```
+
+### Running Tests
+
+The `aura/` modules and the frontend's Python plumbing are covered by a
+pytest suite that does **not** require a GPU, the vLLM engine, or any of
+the heavy model downloads:
+
+```bash
+source .venv/bin/activate
+python -m pytest tests/ -q
+```
+
+All 134 tests should pass in a few seconds. They cover the wire
+protocol, session state, TTS controller state machine, SSE framing,
+video decoding, cross-turn penalty, history pruning, and server_io
+error isolation. This makes it safe to iterate on the Python side
+without spinning up an inference node.
 
 ### Troubleshooting
 
