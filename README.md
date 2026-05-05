@@ -320,7 +320,6 @@ Main inference parameters in `Qwen3_VL_online_streaming_v2_CM.sh`:
 ├── context_manage.py                         # Context management utilities
 ├── realtime_capture_video_audio_streaming.py  # Web frontend middleware (Flask)
 ├── templates/index_streaming.html            # Browser UI (main interface)
-├── templates/video-call.html                 # Browser UI (video call style)
 ├── requirements.txt                          # Python dependencies
 ├── shuhan.mp3                                # TTS reference audio for voice cloning
 └── Qwen3-TTS-streaming/                      # TTS model inference library
