@@ -18,7 +18,6 @@ from aura.protocol import (
     unpack_header,
     STREAMING_TOKEN_TYPE,
     ASR_QUERY_ECHO_TYPE,
-    TTS_AUDIO_TYPE,
     TTS_AUDIO_CHUNK_TYPE,
 )
 from aura.session import StreamingSession
@@ -26,7 +25,6 @@ from aura.session_history import SessionHistory
 from aura.server_io import (
     send_streaming_token,
     send_asr_query,
-    send_audio,
     send_audio_chunk,
 )
 
@@ -124,24 +122,6 @@ def test_send_audio_chunk_payload_layout():
         b.close()
 
 
-def test_send_audio_type_5_frame():
-    a, b = socket.socketpair()
-    try:
-        session = make_session(a)
-        send_audio(session, audio_bytes=b"WAVE_DATA", response_id="r1",
-                   sentence_idx=0, total_sentences=3)
-        msg_type, payload = recv_message(b)
-        assert msg_type == TTS_AUDIO_TYPE
-        rid_len = payload[0]
-        assert payload[1:1+rid_len].decode() == "r1"
-        sidx, total = struct.unpack(">HH", payload[1+rid_len:1+rid_len+4])
-        assert (sidx, total) == (0, 3)
-        assert payload[1+rid_len+4:] == b"WAVE_DATA"
-    finally:
-        a.close()
-        b.close()
-
-
 # ---------------------------------------------------------------------------
 # Error isolation — the core bug fix
 # ---------------------------------------------------------------------------
@@ -152,7 +132,6 @@ def test_send_with_null_conn_is_noop():
     # Should not raise:
     send_streaming_token(session, "x", "r1")
     send_asr_query(session, "x")
-    send_audio(session, b"abc", "r1")
     send_audio_chunk(session, b"\x00\x00", "r1", 0, 0, 24000)
 
 

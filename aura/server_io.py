@@ -18,7 +18,6 @@ from aura.protocol import (
     pack_header,
     STREAMING_TOKEN_TYPE,
     ASR_QUERY_ECHO_TYPE,
-    TTS_AUDIO_TYPE,
     TTS_AUDIO_CHUNK_TYPE,
 )
 
@@ -86,28 +85,6 @@ def send_asr_query(session, query: str):
     payload = json.dumps(response_data, ensure_ascii=False).encode('utf-8')
     if _send(session, ASR_QUERY_ECHO_TYPE, payload):
         print(f"📤 [Plan2] Sent ASR query to client immediately: {query[:50]}...")
-
-
-def send_audio(session, audio_bytes: bytes, response_id: str = None,
-               sentence_idx: int = 0, total_sentences: int = 1):
-    """Send audio data to the connected client.
-
-    Protocol: Type 5 (TTS Audio) - Complete WAV file per sentence
-    """
-    if session.conn is None:
-        return
-    response_id_bytes = (response_id or "").encode('utf-8')
-    response_id_len = len(response_id_bytes)
-
-    # Protocol: Type 5 | length | response_id_len | response_id | sentence_idx | total_sentences | audio_data
-    payload = (
-        struct.pack(">B", response_id_len) +
-        response_id_bytes +
-        struct.pack(">HH", sentence_idx, total_sentences) +
-        audio_bytes
-    )
-    if _send(session, TTS_AUDIO_TYPE, payload):
-        print(f"🔊 Sent TTS sentence {sentence_idx + 1}/{total_sentences} ({len(audio_bytes)} bytes)")
 
 
 def send_audio_chunk(session, pcm_bytes: bytes, response_id: str,

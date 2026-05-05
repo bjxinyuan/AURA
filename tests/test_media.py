@@ -11,7 +11,7 @@ import cv2
 import numpy as np
 import pytest
 
-from aura.media import _decode_video_sync, downsample_video_to_numpy
+from aura.media import downsample_video_to_numpy
 
 
 def _synthesise_video(path: Path, num_frames: int, fps: int,
@@ -88,30 +88,3 @@ def test_resize_halves_dimensions(tmp_path):
     assert arr is not None
     # Original 80x64 → 1/8 → 10x8
     assert arr.shape[1:3] == (8, 10)   # (H, W)
-
-
-def test_decode_video_sync_writes_and_cleans_up(tmp_path):
-    """_decode_video_sync: writes file_data, decodes, removes file."""
-    # Build a tiny video in memory: encode with writer, then read bytes
-    src_video = tmp_path / "src.avi"
-    _synthesise_video(src_video, num_frames=10, fps=10)
-    file_data = src_video.read_bytes()
-
-    dest_path = tmp_path / "sync_tmp.avi"
-    arr, meta = _decode_video_sync(
-        file_data, str(dest_path), target_fps=2.0, resize=False,
-    )
-    assert arr is not None and meta is not None
-    # Temp file should have been cleaned up
-    assert not dest_path.exists(), "_decode_video_sync should remove the input file"
-
-
-def test_decode_video_sync_cleans_up_on_decode_failure(tmp_path):
-    """Even when downsample fails, _decode_video_sync still removes the temp file."""
-    dest_path = tmp_path / "bad.avi"
-    garbage = b"this is not a valid video stream"
-    arr, meta = _decode_video_sync(
-        garbage, str(dest_path), target_fps=2.0, resize=False,
-    )
-    assert arr is None and meta is None
-    assert not dest_path.exists(), "temp file must be removed even when decode fails"

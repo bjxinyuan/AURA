@@ -13,8 +13,6 @@ CLEAR_CONTEXT_TYPE = 4
 START_CAMERA_TYPE = 6
 
 # Server -> Client
-RESPONSE_TYPE = 3              # legacy, complete text response
-TTS_AUDIO_TYPE = 5             # legacy, complete WAV per sentence
 ERROR_TYPE = 7
 STREAMING_TOKEN_TYPE = 8
 TTS_AUDIO_CHUNK_TYPE = 9       # streaming raw PCM

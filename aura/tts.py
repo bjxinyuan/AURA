@@ -9,7 +9,6 @@ Algorithm, logging, and timing are preserved verbatim from the pre-refactor
 Qwen3_VL_online_streaming_v2_ContextManaged.py.
 """
 import datetime
-import io
 import queue
 import re
 import struct
@@ -18,7 +17,7 @@ import time as _time
 import traceback
 
 import requests
-from aura.server_io import send_audio, send_audio_chunk
+from aura.server_io import send_audio_chunk
 from aura.text_utils import remove_markdown
 
 
@@ -320,13 +319,16 @@ class TTSController:
     # ---- worker loop (runs in its own thread) ---------------------------
 
     def _worker_loop(self, args):
-        """TTS worker thread loop - uses sentence queue for streaming TTS.
+        """TTS worker thread loop - streams Type 9 (TTS Audio Chunk) raw PCM
+        chunks for each sentence, one empty final marker per sentence.
 
-        Protocol modes:
-          - Base model: Type 9 (TTS Audio Chunk) - true streaming PCM chunks
-          - CustomVoice model: Type 5 (TTS Audio) - complete WAV
+        The CustomVoice / Type 5 (complete WAV) path was removed: the Flask
+        bridge no longer routes Type 5 messages, and no production TTS
+        deployment still uses that path.
         """
-        # Query model type from remote TTS service
+        # Probe remote service so startup logs show what we're connected to;
+        # health check is informational only, the main pipeline is the same
+        # regardless of model type.
         model_type = "base"
         try:
             resp = requests.get(f"{self.service_url}/v1/tts/health", timeout=5)
@@ -336,9 +338,7 @@ class TTSController:
             # ValueError covers JSONDecodeError when the service returns non-JSON
             pass
 
-        use_chunk_streaming = (model_type == "base")
-        print(f"🔊 TTS Worker started (Remote service, Model: {model_type}, "
-              f"Chunk Streaming: {use_chunk_streaming})")
+        print(f"🔊 TTS Worker started (Remote service, Model: {model_type})")
 
         while True:
             task = self._get_task(timeout=0.1)
@@ -373,116 +373,64 @@ class TTSController:
                 total_samples = 0
                 first_chunk_latency = 0.0
 
-                if use_chunk_streaming:
-                    # ========== TRUE STREAMING MODE (Base model) ==========
-                    for audio_bytes, sample_rate in _text_to_speech_generator(
-                        self.service_url, text, language, speaker, instruct
-                    ):
-                        if self.should_cancel():
-                            print(f"⏹ TTS cancelled for sentence {sentence_idx}")
-                            break
+                for audio_bytes, sample_rate in _text_to_speech_generator(
+                    self.service_url, text, language, speaker, instruct
+                ):
+                    if self.should_cancel():
+                        print(f"⏹ TTS cancelled for sentence {sentence_idx}")
+                        break
 
-                        sr = sample_rate
-                        total_samples += len(audio_bytes) // 2  # int16 = 2 bytes
+                    sr = sample_rate
+                    total_samples += len(audio_bytes) // 2  # int16 = 2 bytes
 
+                    send_audio_chunk(
+                        session,
+                        pcm_bytes=audio_bytes,
+                        response_id=response_id,
+                        sentence_idx=sentence_idx,
+                        chunk_idx=chunk_idx,
+                        sample_rate=sr,
+                        is_final=False,
+                    )
+
+                    if not first_chunk_sent:
+                        first_chunk_latency = _time.time() - sentence_start
+                        print(f"🚀 [TTS] First chunk sent in {first_chunk_latency:.3f}s")
+                        first_chunk_sent = True
+
+                    chunk_idx += 1
+
+                if chunk_idx > 0:
+                    sentence_time = _time.time() - sentence_start
+                    audio_duration = total_samples / sr if sr > 0 else 0
+
+                    self._log_latency(
+                        response_id=response_id,
+                        sentence_idx=sentence_idx,
+                        text=text,
+                        first_chunk_latency=first_chunk_latency,
+                        total_latency=sentence_time,
+                        audio_duration=audio_duration,
+                        num_chunks=chunk_idx,
+                        model_type=model_type,
+                    )
+
+                    if not self.should_cancel():
                         send_audio_chunk(
                             session,
-                            pcm_bytes=audio_bytes,
+                            pcm_bytes=b'',  # Empty data for final marker
                             response_id=response_id,
                             sentence_idx=sentence_idx,
                             chunk_idx=chunk_idx,
                             sample_rate=sr,
-                            is_final=False,
+                            is_final=True,
                         )
-
-                        if not first_chunk_sent:
-                            first_chunk_latency = _time.time() - sentence_start
-                            print(f"🚀 [TTS] First chunk sent in {first_chunk_latency:.3f}s")
-                            first_chunk_sent = True
-
-                        chunk_idx += 1
-
-                    if chunk_idx > 0:
-                        sentence_time = _time.time() - sentence_start
-                        audio_duration = total_samples / sr if sr > 0 else 0
-
-                        self._log_latency(
-                            response_id=response_id,
-                            sentence_idx=sentence_idx,
-                            text=text,
-                            first_chunk_latency=first_chunk_latency,
-                            total_latency=sentence_time,
-                            audio_duration=audio_duration,
-                            num_chunks=chunk_idx,
-                            model_type=model_type,
-                        )
-
-                        if not self.should_cancel():
-                            send_audio_chunk(
-                                session,
-                                pcm_bytes=b'',  # Empty data for final marker
-                                response_id=response_id,
-                                sentence_idx=sentence_idx,
-                                chunk_idx=chunk_idx,
-                                sample_rate=sr,
-                                is_final=True,
-                            )
-                            print(f"🔊 [TTS] Sentence {sentence_idx} complete: "
-                                  f"{chunk_idx} chunks, {audio_duration:.1f}s audio "
-                                  f"in {sentence_time:.2f}s")
-                        else:
-                            print(f"⏹ [TTS] Sentence {sentence_idx} cancelled after "
-                                  f"{chunk_idx} chunks")
-
-                else:
-                    # ========== LEGACY MODE (CustomVoice model) ==========
-                    import numpy as np      # lazy (CustomVoice branch only)
-                    import soundfile as sf  # lazy (CustomVoice branch only)
-                    audio_parts = []
-
-                    for audio_bytes, sample_rate in _text_to_speech_generator(
-                        self.service_url, text, language, speaker, instruct
-                    ):
-                        if self.should_cancel():
-                            print(f"⏹ TTS cancelled for sentence {sentence_idx}")
-                            break
-
-                        if not first_chunk_sent:
-                            first_chunk_latency = _time.time() - sentence_start
-                            first_chunk_sent = True
-
-                        audio_parts.append(np.frombuffer(audio_bytes, dtype=np.int16))
-                        sr = sample_rate
-
-                    if audio_parts:
-                        full_audio = np.concatenate(audio_parts)
-                        sentence_time = _time.time() - sentence_start
-                        audio_duration = len(full_audio) / sr
-
-                        self._log_latency(
-                            response_id=response_id,
-                            sentence_idx=sentence_idx,
-                            text=text,
-                            first_chunk_latency=first_chunk_latency,
-                            total_latency=sentence_time,
-                            audio_duration=audio_duration,
-                            num_chunks=len(audio_parts),
-                            model_type=model_type,
-                        )
-
-                        if not self.should_cancel():
-                            wav_buffer = io.BytesIO()
-                            sf.write(wav_buffer, full_audio, sr, format='WAV')
-                            wav_bytes = wav_buffer.getvalue()
-
-                            estimated_total = sentence_idx + 1
-                            send_audio(session, wav_bytes, response_id,
-                                       sentence_idx, estimated_total)
-                            print(f"🔊 [TTS] Sent sentence {sentence_idx} "
-                                  f"({audio_duration:.1f}s WAV in {sentence_time:.2f}s)")
-                        else:
-                            print(f"⏹ [TTS] Sentence {sentence_idx} cancelled after "
-                                  f"{len(audio_parts)} chunks")
+                        print(f"🔊 [TTS] Sentence {sentence_idx} complete: "
+                              f"{chunk_idx} chunks, {audio_duration:.1f}s audio "
+                              f"in {sentence_time:.2f}s")
+                    else:
+                        print(f"⏹ [TTS] Sentence {sentence_idx} cancelled after "
+                              f"{chunk_idx} chunks")
 
                 with self._pending_lock:
                     self._current_response_id = None

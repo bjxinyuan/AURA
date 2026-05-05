@@ -33,7 +33,6 @@ Qwen3 Omni Streaming Input Example
 
 import argparse
 import asyncio
-import base64
 import json
 import os
 import signal
@@ -42,16 +41,13 @@ import struct
 import tempfile
 import threading
 import time
-from collections import Counter
 from dataclasses import dataclass
 from typing import Optional
 
-import cv2
 import numpy as np
 import aiohttp
 import requests
 import re  # Added for TTS sentence splitting
-import sys
 
 from datetime import datetime
 
@@ -72,11 +68,9 @@ from aura.session import StreamingSession
 from aura.server_io import (
     send_streaming_token,
     send_asr_query,
-    send_audio,
-    send_audio_chunk,
 )
 from aura.tts import TTSController
-from aura.media import downsample_video_to_numpy, _decode_video_sync
+from aura.media import downsample_video_to_numpy
 
 # Global configuration
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -974,8 +968,6 @@ def parse_args():
                         help="Number of rounds to keep in sliding window after pruning")
     parser.add_argument("--max-context-qas", type=int, default=10,
                         help="Maximum number of QAs to keep in context history")
-    parser.add_argument("--dedup-threshold", type=float, default=0.0,
-                        help="(deprecated, no longer used)")
     parser.add_argument("--cross-turn-penalty", type=float, default=0.0,
                         help="Cross-turn repetition penalty strength "
                              "(0=disabled, 2.0~3.0 recommended). "

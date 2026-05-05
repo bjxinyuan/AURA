@@ -28,6 +28,19 @@ import time
 import queue
 
 from aura.sse import format_sse_stream
+from aura.protocol import (
+    pack_header,
+    unpack_header,
+    HEADER_SIZE,
+    VIDEO_TYPE,
+    AUDIO_TYPE,
+    CLEAR_CONTEXT_TYPE,
+    START_CAMERA_TYPE,
+    ERROR_TYPE,
+    STREAMING_TOKEN_TYPE,
+    TTS_AUDIO_CHUNK_TYPE,
+    ASR_QUERY_ECHO_TYPE,
+)
 from collections import deque
 from flask import Flask, render_template, request, jsonify, Response
 from flask_cors import CORS
@@ -49,16 +62,6 @@ VIDEO_SEND_INTERVAL = 1.0
 # VIDEO_BUFFER_DURATION = 2.0  # 缓存最近 2 秒的视频（共约 4 帧）
 # video_buffer = deque()  # 存储 (timestamp, data)
 last_video_send_time = 0
-
-# 协议类型
-VIDEO_TYPE = b'\x01'
-AUDIO_TYPE = b'\x02'
-CLEAR_CONTEXT_TYPE = b'\x04'  # 清空上下文
-START_CAMERA_TYPE = b'\x06'  # 开启摄像头（清理文件夹）
-ERROR_TYPE = 7  # 服务器错误/拒绝消息
-STREAMING_TOKEN_TYPE = 8  # 流式 token
-TTS_AUDIO_CHUNK_TYPE = 9  # TTS 音频 chunk (Raw PCM int16)
-ASR_QUERY_ECHO_TYPE = 10  # ASR query echo (Plan 2: 立即回传用户转写文字)
 
 # 全局socket连接
 socket_lock = threading.Lock()
@@ -138,7 +141,7 @@ def receive_thread_func():
             
         try:
             # 读取头部
-            header = sock.recv(9)
+            header = sock.recv(HEADER_SIZE)
             if not header:
                 logger.warning("服务端关闭了连接")
                 with socket_lock:
@@ -146,8 +149,8 @@ def receive_thread_func():
                         global_socket.close()
                         global_socket = None
                 continue
-                
-            msg_type, msg_len = struct.unpack('>BQ', header)
+
+            msg_type, msg_len = unpack_header(header)
             
             # 读取内容
             data = b''
@@ -239,21 +242,21 @@ def start_receive_thread():
         t.start()
         _receive_thread_started = True
 
-def send_data(data_type: bytes, data: bytes):
+def send_data(data_type: int, data: bytes):
     """发送数据到服务端 (非阻塞，不等待响应)"""
     global global_socket
-    
+
     try:
         sock = get_socket()
         if sock is None:
             return False
-        
-        # 构造消息: 类型(1字节) + 长度(8字节) + 数据
-        message = data_type + struct.pack('>Q', len(data)) + data
-        
+
+        # 构造消息: 9-byte header (type + length) + payload
+        message = pack_header(data_type, len(data)) + data
+
         with socket_lock:
             sock.sendall(message)
-            logger.info(f"✓ 已发送 {len(data)} 字节 ({'视频' if data_type==VIDEO_TYPE else '音频'})")
+            logger.info(f"✓ 已发送 {len(data)} 字节 ({'视频' if data_type == VIDEO_TYPE else '音频'})")
             return True
             
     except Exception as e:

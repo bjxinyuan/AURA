@@ -3,10 +3,6 @@
 Wraps the OpenCV path that turns a browser-uploaded WebM blob into the
 (numpy_array, metadata) tuple that Qwen3-VL expects as its video input.
 
-`downsample_video_to_numpy` is the main entry point; `_decode_video_sync`
-is the thin wrapper used from `run_in_executor` so the asyncio handler
-can offload file write + decode + cleanup to a thread.
-
 Extracted verbatim from Qwen3_VL_online_streaming_v2_ContextManaged.py,
 with two exceptions called out inline:
 - cv2.resize() now receives integer dsize (was `w / 8, h / 8` which raises
@@ -17,27 +13,6 @@ import os
 
 import cv2
 import numpy as np
-
-
-def _decode_video_sync(
-    file_data: bytes,
-    input_path: str,
-    target_fps: float,
-    resize: bool,
-) -> tuple:
-    """Sync helper for run_in_executor: write file, downsample, remove.
-
-    Returns (video_array, metadata) or (None, None).
-    """
-    with open(input_path, "wb") as f:
-        f.write(file_data)
-    try:
-        return downsample_video_to_numpy(input_path, target_fps=target_fps, resize=resize)
-    finally:
-        try:
-            os.remove(input_path)
-        except OSError:
-            pass
 
 
 def downsample_video_to_numpy(
