@@ -42,7 +42,7 @@ import struct
 import tempfile
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
@@ -86,10 +86,9 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 # Special token IDs
 # Qwen3 Omni 和 Qwen3 VL 的 silent token ID 不同:
-#   Qwen3 VL:   SILENT_TOKEN_ID = 151669  (<|silent|>)
-#   Qwen3 Omni: SILENT_TOKEN_ID = 151676  (<|silent|>), 151669 在 Omni 中是 <|audio_start|>
-# SILENT_TOKEN_ID 在 main() 中根据 --model 路径动态设置
-SILENT_TOKEN_ID = None  # 由 detect_model_type() 设置
+#   Qwen3 VL:   silent_token_id = 151669  (<|silent|>)
+#   Qwen3 Omni: silent_token_id = 151676  (<|silent|>), 151669 在 Omni 中是 <|audio_start|>
+# silent_token_id 在 main() 中根据 --model 路径动态设置 (see ctx.silent_token_id).
 IM_END_TOKEN_ID = 151645   # <|im_end|> token id
 
 VISION_START_TOKEN_ID = 151652 # <|vision_start|>
@@ -102,6 +101,33 @@ IMAGE_PAD_TOKEN_ID = 151655    # <|image_pad|>
 logger = logging.getLogger("aura.inference")
 
 
+# ============================================================================
+# Server Context — process-wide mutable state in one container.
+# ============================================================================
+#
+# Everything mutable that used to live as `global FOO` now lives as a field
+# on the module-level `ctx` singleton below. Fields can be reassigned
+# (`ctx.async_engine = ...`) without a `global` declaration because the
+# binding of `ctx` itself never changes — only its attributes do.
+#
+# Constants (IM_END_TOKEN_ID, VISION_*, VIDEO_DIR, AUDIO_DIR, TTS_OUTPUT_DIR)
+# stay as module-level names since they don't mutate at runtime.
+
+@dataclass
+class ServerContext:
+    silent_token_id: Optional[int] = None
+    tts_ctl: TTSController = field(default_factory=TTSController)
+    streaming_sessions: dict = field(default_factory=dict)
+    session_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    async_engine: Optional[AsyncLLM] = None
+    model_tokenizer: object = None
+    response_id_counter: int = 0
+    response_id_lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+ctx = ServerContext()
+
+
 def detect_model_type(model_path: str) -> str:
     """根据模型路径判断模型类型: 'omni' 或 'vl'"""
     name = os.path.basename(model_path.rstrip("/")).lower()
@@ -111,14 +137,13 @@ def detect_model_type(model_path: str) -> str:
 
 
 def setup_silent_token_id(model_path: str):
-    """根据模型路径设置全局 SILENT_TOKEN_ID"""
-    global SILENT_TOKEN_ID
+    """根据模型路径设置 ctx.silent_token_id"""
     model_type = detect_model_type(model_path)
     if model_type == "omni":
-        SILENT_TOKEN_ID = 151676
+        ctx.silent_token_id = 151676
     else:
-        SILENT_TOKEN_ID = 151669
-    logger.info(f"🔧 Model type detected: {model_type} → SILENT_TOKEN_ID = {SILENT_TOKEN_ID}")
+        ctx.silent_token_id = 151669
+    logger.info(f"🔧 Model type detected: {model_type} → silent_token_id = {ctx.silent_token_id}")
 
 
 # SessionHistory has moved to aura/session_history.py (see arch.md §5.1).
@@ -133,37 +158,18 @@ def setup_silent_token_id(model_path: str):
 
 # StreamingSession moved to aura/session.py
 
-# ============================================================================
-# Global State
-# ============================================================================
-
-# TTSController owns all TTS state (sentence queue, worker thread, cancel flag).
-tts_ctl = TTSController()
-
-# Streaming session state
-streaming_sessions: dict[str, StreamingSession] = {}
-session_lock = asyncio.Lock()
 
 # Directories
 VIDEO_DIR = "real_time_captured_video"
 AUDIO_DIR = "real_time_captured_audio"
 TTS_OUTPUT_DIR = "tts_results"
 
-# Engine instance
-async_engine: Optional[AsyncLLM] = None
-model_tokenizer = None
-
-# Response ID counter
-response_id_counter = 0
-response_id_lock = threading.Lock()
-
 
 def generate_response_id() -> str:
     """Generate a unique response ID."""
-    global response_id_counter
-    with response_id_lock:
-        response_id_counter += 1
-        return f"resp_{int(time.time() * 1000)}_{response_id_counter}"
+    with ctx.response_id_lock:
+        ctx.response_id_counter += 1
+        return f"resp_{int(time.time() * 1000)}_{ctx.response_id_counter}"
 
 
 # Video decoding moved to aura/media.py.
@@ -248,7 +254,7 @@ async def transcribe_audio_async(audio_path: str, asr_url: str) -> str:
         return ""
 
 
-# TTS pipeline moved to aura/tts.py — see `tts_ctl` above.
+# TTS pipeline moved to aura/tts.py — see `ctx.tts_ctl` above.
 
 
 # ============================================================================
@@ -257,8 +263,6 @@ async def transcribe_audio_async(audio_path: str, asr_url: str) -> str:
 
 async def init_async_engine(args) -> AsyncLLM:
     """Initialize the AsyncLLM engine with streaming support."""
-    global async_engine
-
     # Build engine args dict, only include non-None values
     engine_kwargs = {
         "model": args.model,
@@ -296,17 +300,16 @@ async def init_async_engine(args) -> AsyncLLM:
 
     model_label = "Qwen3 Omni" if detect_model_type(args.model) == "omni" else "Qwen3 VL"
     logger.info(f"🚀 Initializing {model_label} AsyncLLM engine with model: {args.model}")
-    logger.info(f"   trust_remote_code={engine_kwargs['trust_remote_code']}, SILENT_TOKEN_ID={SILENT_TOKEN_ID}")
-    async_engine = AsyncLLM.from_engine_args(engine_args)
+    logger.info(f"   trust_remote_code={engine_kwargs['trust_remote_code']}, silent_token_id={ctx.silent_token_id}")
+    ctx.async_engine = AsyncLLM.from_engine_args(engine_args)
     logger.info(f"✅ {model_label} AsyncLLM engine initialized successfully")
 
-    # Store tokenizer globally for CrossTurnPenalty
-    global model_tokenizer
-    model_tokenizer = async_engine.get_tokenizer()
+    # Store tokenizer on ctx for CrossTurnPenalty
+    ctx.model_tokenizer = ctx.async_engine.get_tokenizer()
 
     # ========== DEBUG: 保存词表到日志文件 ==========
     try:
-        tokenizer = model_tokenizer
+        tokenizer = ctx.model_tokenizer
         vocab = tokenizer.get_vocab()  # Dict[str, int]: token_str -> token_id
 
         vocab_log_path = "vocab_debug.log"
@@ -334,7 +337,7 @@ async def init_async_engine(args) -> AsyncLLM:
     # - Build prompt string with placeholders
     # - Pass images via multi_modal_data
 
-    return async_engine
+    return ctx.async_engine
 
 
 async def generate_response_with_video(
@@ -354,9 +357,8 @@ async def generate_response_with_video(
                     metadata_dict: {"fps": float, "duration": float, ...}
     """
     logger.info(f"==== Calling generate_response_with_video() ====")
-    global async_engine
 
-    if async_engine is None:
+    if ctx.async_engine is None:
         raise RuntimeError("AsyncLLM engine not initialized")
 
     if video_tuple is None or video_tuple[0] is None:
@@ -402,10 +404,10 @@ async def generate_response_with_video(
         is_silent_response = False
         ttft = 0
 
-        tts_enabled_for_this_response = args and args.enable_tts and tts_ctl.enabled
+        tts_enabled_for_this_response = args and args.enable_tts and ctx.tts_ctl.enabled
 
         if tts_enabled_for_this_response and prompt:
-            tts_ctl.clear_queue(new_response_id=request_id)
+            ctx.tts_ctl.clear_queue(new_response_id=request_id)
 
         # Timing measurements
         generation_start_time = time.time()
@@ -423,7 +425,7 @@ async def generate_response_with_video(
         streaming_started = False
 
         # ===== Streaming generation: send tokens to frontend as they arrive =====
-        async for response in async_engine.generate(
+        async for response in ctx.async_engine.generate(
             prompt=vllm_inputs,
             sampling_params=sampling_params,
             request_id=request_id,
@@ -437,10 +439,10 @@ async def generate_response_with_video(
             if response.outputs:
                 output = response.outputs[0]
 
-                if len(output.token_ids) > 0 and output.token_ids[0] in (SILENT_TOKEN_ID, IM_END_TOKEN_ID):
+                if len(output.token_ids) > 0 and output.token_ids[0] in (ctx.silent_token_id, IM_END_TOKEN_ID):
                     is_silent_response = True
                     first_tid = output.token_ids[0]
-                    tag = "SILENT" if first_tid == SILENT_TOKEN_ID else "IM_END"
+                    tag = "SILENT" if first_tid == ctx.silent_token_id else "IM_END"
                     logger.info(f"🔇 [Session {session.session_id}] {tag} as first token → silent response "
                           f"(first_token_id={first_tid}, token_ids={list(output.token_ids[:5])}...)")
                     break
@@ -476,7 +478,7 @@ async def generate_response_with_video(
                                 sentence = _tts_sentence_buf[:split_pos]
                                 _tts_sentence_buf = _tts_sentence_buf[split_pos:]
                                 if sentence.strip():
-                                    tts_ctl.enqueue_sentence(sentence, session, request_id, _tts_sentence_idx, args)
+                                    ctx.tts_ctl.enqueue_sentence(sentence, session, request_id, _tts_sentence_idx, args)
                                     _tts_sentence_idx += 1
 
         # ===== Generation finished — decide: silent / send =====
@@ -513,7 +515,7 @@ async def generate_response_with_video(
 
             # Flush remaining TTS sentence buffer
             if tts_enabled_for_this_response and _tts_sentence_buf.strip():
-                tts_ctl.enqueue_sentence(_tts_sentence_buf, session, request_id, _tts_sentence_idx, args)
+                ctx.tts_ctl.enqueue_sentence(_tts_sentence_buf, session, request_id, _tts_sentence_idx, args)
                 _tts_sentence_idx += 1
 
             if tts_enabled_for_this_response:
@@ -792,9 +794,9 @@ async def handle_client_connection_async(conn, addr, args):
 
     # Build cross-turn penalty manager (if enabled)
     penalty_mgr = None
-    if getattr(args, "cross_turn_penalty", 0) > 0 and model_tokenizer is not None:
+    if getattr(args, "cross_turn_penalty", 0) > 0 and ctx.model_tokenizer is not None:
         penalty_mgr = CrossTurnPenalty(
-            tokenizer=model_tokenizer,
+            tokenizer=ctx.model_tokenizer,
             window=getattr(args, "cross_turn_lookback", 2),
             logit_penalty=args.cross_turn_penalty,
             ngram_sizes=getattr(args, "cross_turn_ngram_sizes", [3, 4, 5]),
@@ -820,8 +822,8 @@ async def handle_client_connection_async(conn, addr, args):
     )
     session.conn = conn
 
-    async with session_lock:
-        streaming_sessions[session_id] = session
+    async with ctx.session_lock:
+        ctx.streaming_sessions[session_id] = session
 
     try:
         while True:
@@ -868,9 +870,9 @@ async def handle_client_connection_async(conn, addr, args):
         logger.info(f"👋 Connection closed by {addr}")
 
         # Cleanup
-        async with session_lock:
-            if session_id in streaming_sessions:
-                del streaming_sessions[session_id]
+        async with ctx.session_lock:
+            if session_id in ctx.streaming_sessions:
+                del ctx.streaming_sessions[session_id]
 
         # session.conn may already be None if server_io dropped it on a write error
         session.conn = None
@@ -1036,7 +1038,7 @@ async def main_async(args):
         except OSError as e:
             logger.warning(f"⚠️ [Debug] Failed to clear context file: {e}")
 
-    # 根据 model path 动态设置 SILENT_TOKEN_ID
+    # 根据 model path 动态设置 ctx.silent_token_id
     setup_silent_token_id(args.model)
 
     model_type = detect_model_type(args.model)
@@ -1082,8 +1084,8 @@ async def main_async(args):
 
     # Initialize TTS if enabled
     if args.enable_tts:
-        if tts_ctl.configure(args):
-            tts_ctl.start_worker(args)
+        if ctx.tts_ctl.configure(args):
+            ctx.tts_ctl.start_worker(args)
         else:
             logger.warning("⚠ TTS initialization failed, TTS will be disabled")
     # logger.warning("⚠ TTS initialization failed, TTS will be disabled")
