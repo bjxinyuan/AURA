@@ -117,7 +117,7 @@ def get_socket():
             start_receive_thread()
             
             return global_socket
-        except Exception as e:
+        except OSError as e:
             if not connection_error_logged:
                 logger.warning(f"⚠ 服务端 {SERVER_HOST}:{SERVER_PORT} 不可用: {e}")
                 logger.info(f"   将每 {connect_retry_interval} 秒重试连接...")
@@ -170,11 +170,11 @@ def receive_thread_func():
                     if global_socket == sock:
                         try:
                             global_socket.close()
-                        except:
+                        except OSError:
                             pass
                         global_socket = None
                 break  # 退出接收循环
-            
+
             elif msg_type == STREAMING_TOKEN_TYPE:
                 # Streaming model output → SSE "token" event; payload.raw
                 # is the original JSON-encoded token envelope from backend.
@@ -182,9 +182,9 @@ def receive_thread_func():
                     token_data = data.decode('utf-8')
                     logger.debug(f"📝 收到流式 token: {token_data[:50]}...")
                     event_queue.put(("token", {"raw": token_data}))
-                except Exception as e:
+                except UnicodeDecodeError as e:
                     logger.error(f"解析流式 token 失败: {e}")
-            
+
             elif msg_type == ASR_QUERY_ECHO_TYPE:
                 # Plan 2: ASR query echo — share the "token" channel because
                 # the frontend routes both through handleStreamingToken.
@@ -192,11 +192,11 @@ def receive_thread_func():
                     token_data = data.decode('utf-8')
                     logger.info(f"📤 收到 ASR query echo: {token_data[:50]}...")
                     event_queue.put(("token", {"raw": token_data}))
-                except Exception as e:
+                except UnicodeDecodeError as e:
                     logger.error(f"解析 ASR query echo 失败: {e}")
 
             elif msg_type == TTS_AUDIO_CHUNK_TYPE:
-                # 收到 TTS 音频 chunk (Raw PCM int16) - Step 2 新增
+                # 收到 TTS 音频 chunk (Raw PCM int16)
                 # 协议: response_id_len(1) + response_id + sentence_idx(2) + chunk_idx(2) + sample_rate(4) + is_final(1) + pcm_data
                 try:
                     response_id_len = data[0]
@@ -204,14 +204,14 @@ def receive_thread_func():
                     offset = 1 + response_id_len
                     sentence_idx, chunk_idx, sample_rate, is_final = struct.unpack(">HHIB", data[offset:offset+9])
                     pcm_data = data[offset+9:]
-                    
+
                     if is_final:
                         logger.info(f"🔊 收到 TTS chunk [final] sentence={sentence_idx}")
                     else:
                         # 每10个chunk打印一次，避免日志过多
                         if chunk_idx % 10 == 0:
                             logger.info(f"🔊 收到 TTS chunk sentence={sentence_idx} chunk={chunk_idx} ({len(pcm_data)} bytes)")
-                    
+
                     event_queue.put(("chunk", {
                         "response_id": response_id,
                         "sentence_idx": sentence_idx,
@@ -220,16 +220,20 @@ def receive_thread_func():
                         "is_final": bool(is_final),
                         "pcm_base64": base64.b64encode(pcm_data).decode("ascii") if pcm_data else "",
                     }))
-                except Exception as parse_e:
+                except (struct.error, UnicodeDecodeError, IndexError) as parse_e:
+                    # IndexError covers truncated payloads where data[0] / data[offset:...] slice empty
                     logger.error(f"解析 TTS 音频 chunk 协议失败: {parse_e}")
-                
-        except Exception as e:
-            logger.error(f"接收线程错误: {e}")
+
+        except OSError as e:
+            # Top-level receive-loop catch for socket I/O failures. A narrow
+            # except here keeps real programming bugs (KeyError, TypeError)
+            # visible instead of silently reconnecting.
+            logger.error(f"接收线程 socket 错误: {e}")
             with socket_lock:
                 if global_socket == sock:
                     try:
                         global_socket.close()
-                    except:
+                    except OSError:
                         pass
                     global_socket = None
             time.sleep(1)
@@ -259,13 +263,13 @@ def send_data(data_type: int, data: bytes):
             logger.info(f"✓ 已发送 {len(data)} 字节 ({'视频' if data_type == VIDEO_TYPE else '音频'})")
             return True
             
-    except Exception as e:
+    except OSError as e:
         logger.error(f"发送数据失败: {e}")
         with socket_lock:
             if global_socket:
                 try:
                     global_socket.close()
-                except:
+                except OSError:
                     pass
                 global_socket = None
         return False
@@ -309,7 +313,10 @@ def receive_video():
         })
         
     except Exception as e:
-        logger.error(f"处理视频帧失败: {e}")
+        # Top-level Flask route catch: convert any unhandled error into a
+        # structured JSON response so the browser doesn't get Flask's default
+        # HTML 500 page. Stack is logged for diagnosis.
+        logger.error(f"处理视频帧失败: {e}", exc_info=True)
         return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/api/audio', methods=['POST'])
@@ -337,7 +344,8 @@ def receive_audio():
         })
         
     except Exception as e:
-        logger.error(f"处理音频失败: {e}")
+        # Top-level Flask route catch — see /api/video for rationale.
+        logger.error(f"处理音频失败: {e}", exc_info=True)
         return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/api/status', methods=['GET'])
@@ -457,9 +465,9 @@ def clear_media():
                 try:
                     os.remove(f)
                     deleted_videos += 1
-                except Exception as e:
+                except OSError as e:
                     logger.warning(f"删除视频文件失败 {f}: {e}")
-            
+
             merged_dir = os.path.join(VIDEO_DIR, "merged")
             if os.path.exists(merged_dir):
                 merged_files = glob.glob(os.path.join(merged_dir, "*.mp4"))
@@ -467,16 +475,16 @@ def clear_media():
                     try:
                         os.remove(f)
                         deleted_videos += 1
-                    except Exception as e:
+                    except OSError as e:
                         logger.warning(f"删除合并视频失败 {f}: {e}")
-        
+
         # 清理音频文件
         audio_file = os.path.join(AUDIO_DIR, "latest.mp3")
         if os.path.exists(audio_file):
             try:
                 os.remove(audio_file)
                 deleted_audio = True
-            except Exception as e:
+            except OSError as e:
                 logger.warning(f"删除音频文件失败: {e}")
         
         logger.info(f"🗑 已清理媒体文件: {deleted_videos} 个视频, {'1' if deleted_audio else '0'} 个音频")
@@ -492,7 +500,8 @@ def clear_media():
         })
         
     except Exception as e:
-        logger.error(f"清理媒体文件失败: {e}")
+        # Top-level Flask route catch — see /api/video for rationale.
+        logger.error(f"清理媒体文件失败: {e}", exc_info=True)
         return jsonify({
             'success': False,
             'error': str(e)
@@ -523,7 +532,8 @@ def start_camera():
         })
         
     except Exception as e:
-        logger.error(f"发送开启摄像头命令失败: {e}")
+        # Top-level Flask route catch — see /api/video for rationale.
+        logger.error(f"发送开启摄像头命令失败: {e}", exc_info=True)
         return jsonify({
             'success': False,
             'error': str(e)
@@ -577,7 +587,9 @@ def main():
         except ImportError:
             print("❌ pycloudflared 未安装，请运行: pip install pycloudflared")
             use_tunnel = False
-        except Exception as e:
+        except (OSError, RuntimeError) as e:
+            # pycloudflared wraps spawn/network errors as RuntimeError;
+            # OSError covers missing binary or port bind failures.
             print(f"❌ Cloudflare Tunnel 启动失败: {e}")
             use_tunnel = False
     
