@@ -32,6 +32,7 @@ Qwen3 Omni Streaming Input Example
 """
 
 import argparse
+import logging
 import asyncio
 import json
 import os
@@ -97,6 +98,10 @@ VIDEO_PAD_TOKEN_ID = 151656    # <|video_pad|>
 IMAGE_PAD_TOKEN_ID = 151655    # <|image_pad|>
 
 
+
+logger = logging.getLogger("aura.inference")
+
+
 def detect_model_type(model_path: str) -> str:
     """根据模型路径判断模型类型: 'omni' 或 'vl'"""
     name = os.path.basename(model_path.rstrip("/")).lower()
@@ -113,7 +118,7 @@ def setup_silent_token_id(model_path: str):
         SILENT_TOKEN_ID = 151676
     else:
         SILENT_TOKEN_ID = 151669
-    print(f"🔧 Model type detected: {model_type} → SILENT_TOKEN_ID = {SILENT_TOKEN_ID}")
+    logger.info(f"🔧 Model type detected: {model_type} → SILENT_TOKEN_ID = {SILENT_TOKEN_ID}")
 
 
 # SessionHistory has moved to aura/session_history.py (see arch.md §5.1).
@@ -179,7 +184,7 @@ def get_audio_prompt(audio_path: str, asr_url: str) -> str:
     Returns:
         Transcribed text, or empty string if failed
     """
-    print(f"🎤 Transcribing audio from {audio_path}...", flush=True)
+    logger.info(f"🎤 Transcribing audio from {audio_path}...")
     try:
         with open(audio_path, 'rb') as f:
             files = {'file': f}
@@ -189,16 +194,16 @@ def get_audio_prompt(audio_path: str, asr_url: str) -> str:
         if response.status_code == 200:
             data = response.json()
             text = data.get("text", "")
-            print(f"✅ Transcribed: {text!r}", flush=True)
+            logger.info(f"✅ Transcribed: {text!r}")
             return text
         else:
-            print(f"❌ ASR failed with status {response.status_code}: {response.text}")
+            logger.error(f"❌ ASR failed with status {response.status_code}: {response.text}")
             return ""
     except requests.exceptions.Timeout:
-        print("❌ ASR request timeout")
+        logger.error("❌ ASR request timeout")
         return ""
     except requests.RequestException as e:
-        print(f"❌ ASR error: {e}")
+        logger.error(f"❌ ASR error: {e}")
         return ""
 
 
@@ -213,7 +218,7 @@ async def transcribe_audio_async(audio_path: str, asr_url: str) -> str:
     Returns:
         Transcribed text, or empty string if failed
     """
-    print(f"🎤 [Async] Transcribing audio from {audio_path}...", flush=True)
+    logger.info(f"🎤 [Async] Transcribing audio from {audio_path}...")
     try:
         async with aiohttp.ClientSession() as session:
             with open(audio_path, 'rb') as f:
@@ -229,17 +234,17 @@ async def transcribe_audio_async(audio_path: str, asr_url: str) -> str:
                     if response.status == 200:
                         result = await response.json()
                         text = result.get("text", "")
-                        print(f"✅ [Async] Transcribed: {text!r}", flush=True)
+                        logger.info(f"✅ [Async] Transcribed: {text!r}")
                         return text
                     else:
                         error_text = await response.text()
-                        print(f"❌ [Async] ASR failed with status {response.status}: {error_text}")
+                        logger.error(f"❌ [Async] ASR failed with status {response.status}: {error_text}")
                         return ""
     except asyncio.TimeoutError:
-        print("❌ [Async] ASR request timeout")
+        logger.error("❌ [Async] ASR request timeout")
         return ""
     except aiohttp.ClientError as e:
-        print(f"❌ [Async] ASR error: {e}")
+        logger.error(f"❌ [Async] ASR error: {e}")
         return ""
 
 
@@ -290,10 +295,10 @@ async def init_async_engine(args) -> AsyncLLM:
     engine_args = AsyncEngineArgs(**engine_kwargs)
 
     model_label = "Qwen3 Omni" if detect_model_type(args.model) == "omni" else "Qwen3 VL"
-    print(f"🚀 Initializing {model_label} AsyncLLM engine with model: {args.model}")
-    print(f"   trust_remote_code={engine_kwargs['trust_remote_code']}, SILENT_TOKEN_ID={SILENT_TOKEN_ID}")
+    logger.info(f"🚀 Initializing {model_label} AsyncLLM engine with model: {args.model}")
+    logger.info(f"   trust_remote_code={engine_kwargs['trust_remote_code']}, SILENT_TOKEN_ID={SILENT_TOKEN_ID}")
     async_engine = AsyncLLM.from_engine_args(engine_args)
-    print(f"✅ {model_label} AsyncLLM engine initialized successfully")
+    logger.info(f"✅ {model_label} AsyncLLM engine initialized successfully")
 
     # Store tokenizer globally for CrossTurnPenalty
     global model_tokenizer
@@ -318,9 +323,9 @@ async def init_async_engine(args) -> AsyncLLM:
                 # 保持格式：ID | 原始字符串 | repr表示（显示转义字符）
                 f.write(f"{token_id:>8} | {token_str:<40} | {repr(token_str)}\n")
 
-        print(f"📝 Vocabulary saved to {vocab_log_path} ({len(vocab)} tokens)")
+        logger.info(f"📝 Vocabulary saved to {vocab_log_path} ({len(vocab)} tokens)")
     except OSError as e:
-        print(f"⚠️ Failed to save vocabulary: {e}")
+        logger.warning(f"⚠️ Failed to save vocabulary: {e}")
     # ========== END DEBUG ==========
 
     # Note: No need to load transformers processor!
@@ -348,14 +353,14 @@ async def generate_response_with_video(
                     numpy_array shape: (num_frames, height, width, 3)
                     metadata_dict: {"fps": float, "duration": float, ...}
     """
-    print(f"==== Calling generate_response_with_video() ====")
+    logger.info(f"==== Calling generate_response_with_video() ====")
     global async_engine
 
     if async_engine is None:
         raise RuntimeError("AsyncLLM engine not initialized")
 
     if video_tuple is None or video_tuple[0] is None:
-        print("⚠️ No valid video for generation")
+        logger.warning("⚠️ No valid video for generation")
         session.is_generating = False
         return
 
@@ -364,7 +369,7 @@ async def generate_response_with_video(
     video_array_check = video_tuple[0]
     if video_array_check.shape[0] < 2:
         import numpy as np
-        print(f"⚠️ Video has only {video_array_check.shape[0]} frame(s), duplicating to meet Qwen3-VL minimum (2 frames)")
+        logger.warning(f"⚠️ Video has only {video_array_check.shape[0]} frame(s), duplicating to meet Qwen3-VL minimum (2 frames)")
         duplicated_array = np.concatenate([video_array_check] * 2, axis=0)[:2]
         video_metadata = video_tuple[1].copy() if video_tuple[1] else {}
         video_metadata["total_num_frames"] = 2
@@ -381,7 +386,7 @@ async def generate_response_with_video(
         # t_get_inputs_start = time.time()
         vllm_inputs = session.history.get_vllm_inputs()
         # t_get_inputs_end = time.time()
-        # print(f"⏱️ [TIMING] get_vllm_inputs() took {(t_get_inputs_end - t_get_inputs_start)*1000:.1f}ms")
+        # logger.info(f"⏱️ [TIMING] get_vllm_inputs() took {(t_get_inputs_end - t_get_inputs_start)*1000:.1f}ms")
 
         # Generate unique request ID for this turn
         request_id = generate_response_id()
@@ -389,8 +394,8 @@ async def generate_response_with_video(
         session.history.save_context_debug(request_id=request_id)
 
         video_array, video_metadata = video_tuple
-        print(f"🎬 [Session {session.session_id}] Starting generation (request_id={request_id})")
-        print(f"📥 Input: {video_array.shape[0]} video frames ({video_array.shape}), prompt='{prompt}'")
+        logger.info(f"🎬 [Session {session.session_id}] Starting generation (request_id={request_id})")
+        logger.info(f"📥 Input: {video_array.shape[0]} video frames ({video_array.shape}), prompt='{prompt}'")
 
         full_response = ""
         previous_text = ""
@@ -406,8 +411,8 @@ async def generate_response_with_video(
         generation_start_time = time.time()
         first_token_time = None
         token_count = 0
-        print(f"[TTFT_DEBUG] stream generate_start request_id={request_id} t={generation_start_time:.6f}")
-        print(f"⏱️ [TIMING] prefill_submit_time={generation_start_time:.6f} (engine.generate called, prefill starts)")
+        logger.info(f"[TTFT_DEBUG] stream generate_start request_id={request_id} t={generation_start_time:.6f}")
+        logger.info(f"⏱️ [TIMING] prefill_submit_time={generation_start_time:.6f} (engine.generate called, prefill starts)")
 
         # Incremental sentence buffer for streaming TTS
         _tts_sentence_buf = ""
@@ -426,7 +431,7 @@ async def generate_response_with_video(
             if first_token_time is None:
                 first_token_time = time.time()
                 ttft = first_token_time - generation_start_time
-                print(f"[TTFT_DEBUG] stream first_token request_id={request_id} t={first_token_time:.6f} ttft_ms={ttft*1000:.1f}")
+                logger.info(f"[TTFT_DEBUG] stream first_token request_id={request_id} t={first_token_time:.6f} ttft_ms={ttft*1000:.1f}")
 
             token_count += 1
             if response.outputs:
@@ -436,7 +441,7 @@ async def generate_response_with_video(
                     is_silent_response = True
                     first_tid = output.token_ids[0]
                     tag = "SILENT" if first_tid == SILENT_TOKEN_ID else "IM_END"
-                    print(f"🔇 [Session {session.session_id}] {tag} as first token → silent response "
+                    logger.info(f"🔇 [Session {session.session_id}] {tag} as first token → silent response "
                           f"(first_token_id={first_tid}, token_ids={list(output.token_ids[:5])}...)")
                     break
 
@@ -478,22 +483,22 @@ async def generate_response_with_video(
         generation_end_time = time.time()
         total_time = generation_end_time - generation_start_time
 
-        print(f"✅ [Session {session.session_id}] Generation finished")
-        print(f"⏱️ [TIMING] Time to first token (TTFT): {ttft*1000:.1f}ms, timestamp: {time.time()}")
-        print(f"⏱️ [TIMING] TTFT avg. by {video_array.shape[0]} frames: {(ttft*1000/video_array.shape[0]):.1f}ms")
-        print(f"⏱️ [TIMING] Total generation time: {total_time*1000:.1f}ms")
-        print(f"⏱️ [TIMING] Tokens generated: {token_count}")
+        logger.info(f"✅ [Session {session.session_id}] Generation finished")
+        logger.info(f"⏱️ [TIMING] Time to first token (TTFT): {ttft*1000:.1f}ms, timestamp: {time.time()}")
+        logger.info(f"⏱️ [TIMING] TTFT avg. by {video_array.shape[0]} frames: {(ttft*1000/video_array.shape[0]):.1f}ms")
+        logger.info(f"⏱️ [TIMING] Total generation time: {total_time*1000:.1f}ms")
+        logger.info(f"⏱️ [TIMING] Tokens generated: {token_count}")
         if token_count > 1 and first_token_time is not None:
             decode_only_ms = (generation_end_time - first_token_time) * 1000
             avg_decode_per_token = decode_only_ms / (token_count - 1)
-            print(f"⏱️ [TIMING] Decode phase: {decode_only_ms:.1f}ms for {token_count-1} tokens, "
+            logger.info(f"⏱️ [TIMING] Decode phase: {decode_only_ms:.1f}ms for {token_count-1} tokens, "
                   f"avg={avg_decode_per_token:.1f}ms/token ({1000/avg_decode_per_token:.1f} tokens/s)")
 
-        print(f"📋 [DECISION] request_id={request_id} | is_silent={is_silent_response} | "
+        logger.info(f"📋 [DECISION] request_id={request_id} | is_silent={is_silent_response} | "
               f"full_response({len(full_response)} chars)='{full_response[:80]}'")
 
         if is_silent_response:
-            print(f"🔇 [DECISION] → MODEL_SILENT (first token was silent/im_end)")
+            logger.info(f"🔇 [DECISION] → MODEL_SILENT (first token was silent/im_end)")
             session.history.add_assistant_message(SILENT_TEXT)
             send_streaming_token(session, SILENT_TEXT, request_id, is_final=True, is_silent=True)
             if session.cross_turn_penalty is not None:
@@ -512,17 +517,17 @@ async def generate_response_with_video(
                 _tts_sentence_idx += 1
 
             if tts_enabled_for_this_response:
-                print(f"🎤 [Queue] Streamed {_tts_sentence_idx} sentences to TTS")
+                logger.info(f"🎤 [Queue] Streamed {_tts_sentence_idx} sentences to TTS")
 
     except asyncio.CancelledError:
-        print(f"⏹ [Session {session.session_id}] Generation cancelled (context reset)")
+        logger.info(f"⏹ [Session {session.session_id}] Generation cancelled (context reset)")
         if streaming_started and request_id:
             send_streaming_token(session, "", request_id, is_final=True)
     except Exception as e:
         # Top-level catch for the async generation task: any uncaught exception
         # here would otherwise silently kill the asyncio task and strand the
         # client waiting for a final token. Keep broad; log stack for diagnosis.
-        print(f"❌ [Session {session.session_id}] Generation error: {e}")
+        logger.error(f"❌ [Session {session.session_id}] Generation error: {e}")
         import traceback
         traceback.print_exc()
         if request_id:
@@ -532,7 +537,7 @@ async def generate_response_with_video(
         session.is_generating = False
         session.is_auto_generating = False
         session.current_task = None
-        print(f"🔓 [Session {session.session_id}] Released generation lock")
+        logger.info(f"🔓 [Session {session.session_id}] Released generation lock")
 
 
 # ============================================================================
@@ -569,14 +574,14 @@ async def _read_header(conn) -> Optional[tuple]:
     except TimeoutError:
         return ("timeout",)
     except ConnectionError:
-        print("🔌 Client disconnected")
+        logger.info("🔌 Client disconnected")
         return None
     except OSError as e:
-        print(f"❌ Header read error: {e}")
+        logger.error(f"❌ Header read error: {e}")
         return None
 
     file_type, file_len = struct.unpack(">BQ", header)
-    print(f"📩 Received: type={file_type}, length={file_len}, time={datetime.now().strftime('%H:%M:%S.%f')}")
+    logger.info(f"📩 Received: type={file_type}, length={file_len}, time={datetime.now().strftime('%H:%M:%S.%f')}")
     return file_type, file_len
 
 
@@ -590,13 +595,13 @@ async def _read_payload(conn, file_len: int) -> Optional[bytes]:
             None, recv_exactly, conn, file_len, 30.0
         )
     except TimeoutError:
-        print(f"⚠ Timeout reading {file_len} bytes, skipping")
+        logger.warning(f"⚠ Timeout reading {file_len} bytes, skipping")
         return b""
     except ConnectionError:
-        print("🔌 Client disconnected during data read")
+        logger.info("🔌 Client disconnected during data read")
         return None
     except OSError as e:
-        print(f"❌ Data read error: {e}")
+        logger.error(f"❌ Data read error: {e}")
         return None
 
 
@@ -604,9 +609,9 @@ def _reset_session_state(session: StreamingSession, reason: str):
     """Cancel any running generation task and clear per-connection scratch
     state. Shared by the Clear-Context (Type 4) and Start-Camera (Type 6)
     branches — they differ only in log message."""
-    print(reason)
+    logger.info(reason)
     if session.current_task and not session.current_task.done():
-        print("⏹ Cancelling running generation task...")
+        logger.info("⏹ Cancelling running generation task...")
         session.current_task.cancel()
         session.is_generating = False
         session.is_auto_generating = False
@@ -624,10 +629,10 @@ def _decode_webm_to_frames(file_data: bytes, args) -> Optional[tuple]:
     truncated so the caller can log once and skip."""
     MIN_WEBM_SIZE = 1000  # 1KB minimum for a valid EBML header
     if len(file_data) < MIN_WEBM_SIZE:
-        print(f"⚠️ Video data too small ({len(file_data)} bytes < {MIN_WEBM_SIZE}), skipping corrupted/incomplete data")
+        logger.warning(f"⚠️ Video data too small ({len(file_data)} bytes < {MIN_WEBM_SIZE}), skipping corrupted/incomplete data")
         return ("too_small",)
 
-    print("🎥 Processing video data...")
+    logger.info("🎥 Processing video data...")
     with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
         tmp.write(file_data)
         input_path = tmp.name
@@ -650,18 +655,18 @@ def _maybe_launch_generation(session: StreamingSession, args):
     should_process = False
     # Priority trigger: pending user prompt.
     if session.last_prompt and total_frames > 0:
-        print(f"⚡ Triggering immediate generation for user prompt (frames={total_frames})")
+        logger.info(f"⚡ Triggering immediate generation for user prompt (frames={total_frames})")
         should_process = True
     # Background trigger: have enough frames and the task is idle.
     elif total_frames >= 2 and not session.is_generating:
-        print(f"⚡ Triggering background generation (frames={total_frames})")
+        logger.info(f"⚡ Triggering background generation (frames={total_frames})")
         should_process = True
 
     if not should_process:
         return
     if session.is_generating:
         if session.last_prompt:
-            print("⏳ Waiting for previous generation to finish before processing prompt...")
+            logger.info("⏳ Waiting for previous generation to finish before processing prompt...")
         return
 
     # Concatenate all accumulated frames.
@@ -670,7 +675,7 @@ def _maybe_launch_generation(session: StreamingSession, args):
     # Qwen3-VL requires at least 2 frames (temporal_factor=2). Duplicate
     # a single frame if necessary.
     if all_frames.shape[0] == 1:
-        print(f"⚠️ Only 1 frame, duplicating to meet Qwen3-VL minimum requirement (2 frames)")
+        logger.warning(f"⚠️ Only 1 frame, duplicating to meet Qwen3-VL minimum requirement (2 frames)")
         all_frames = np.concatenate([all_frames, all_frames], axis=0)
 
     # Limit to max 16 frames to avoid OOM.
@@ -722,12 +727,12 @@ def _handle_video_msg(file_data: bytes, session: StreamingSession, args):
         return
     video_array, _metadata = result
     if video_array is None:
-        print("❌ Video processing failed - no frames extracted (possible codec incompatibility with iOS Chrome)")
+        logger.error("❌ Video processing failed - no frames extracted (possible codec incompatibility with iOS Chrome)")
         return
 
     session.accumulated_video_frames.append(video_array)
     total_frames = sum(arr.shape[0] for arr in session.accumulated_video_frames)
-    print(f"📹 Got {video_array.shape[0]} frames, total accumulated: {total_frames}")
+    logger.info(f"📹 Got {video_array.shape[0]} frames, total accumulated: {total_frames}")
 
     _maybe_launch_generation(session, args)
 
@@ -740,7 +745,7 @@ async def _handle_audio_msg(file_data: bytes, session: StreamingSession, args):
     os.makedirs(AUDIO_DIR, exist_ok=True)
     with open(audio_path, "wb") as f:
         f.write(file_data)
-    print(f"🎤 Saved audio to {audio_path}")
+    logger.info(f"🎤 Saved audio to {audio_path}")
 
     _asr_start = time.time()
     if args.asr_sync:
@@ -751,14 +756,14 @@ async def _handle_audio_msg(file_data: bytes, session: StreamingSession, args):
     else:
         transcribed_text = await transcribe_audio_async(audio_path, args.asr_url)
     _asr_end = time.time()
-    print(f"⏱️ [TIMING] ASR latency: {(_asr_end - _asr_start)*1000:.1f}ms")
+    logger.info(f"⏱️ [TIMING] ASR latency: {(_asr_end - _asr_start)*1000:.1f}ms")
 
     if not transcribed_text:
-        print("⚠ ASR returned empty, will use default prompt")
+        logger.warning("⚠ ASR returned empty, will use default prompt")
         return
 
     session.last_prompt = transcribed_text
-    print(f"📝 Set prompt from ASR: {session.last_prompt[:50]}...")
+    logger.info(f"📝 Set prompt from ASR: {session.last_prompt[:50]}...")
 
     # Plan 2: ASR query is sent to client immediately; model inference
     # result will be sent separately later.
@@ -766,17 +771,17 @@ async def _handle_audio_msg(file_data: bytes, session: StreamingSession, args):
 
     # Optimization: try to trigger immediately if we have any video frames.
     if session.accumulated_video_frames:
-        print("🚀 Audio arrived, attempting immediate trigger...")
+        logger.info("🚀 Audio arrived, attempting immediate trigger...")
         if session.is_generating and session.is_auto_generating:
             if session.current_task and not session.current_task.done():
-                print("🛑 Interrupting auto-generation for user prompt (from Audio event)!")
+                logger.info("🛑 Interrupting auto-generation for user prompt (from Audio event)!")
                 session.current_task.cancel()
 
 
 async def handle_client_connection_async(conn, addr, args):
     """Handle client connection with async support."""
-    print(f"================================================")
-    print(f"✅ Connected by {addr} with SUYI")
+    logger.info(f"================================================")
+    logger.info(f"✅ Connected by {addr} with SUYI")
 
     # Set socket to blocking mode with timeout
     conn.setblocking(True)
@@ -794,7 +799,7 @@ async def handle_client_connection_async(conn, addr, args):
             logit_penalty=args.cross_turn_penalty,
             ngram_sizes=getattr(args, "cross_turn_ngram_sizes", [3, 4, 5]),
         )
-        print(f"🔧 [Session {session_id}] CrossTurnPenalty enabled: "
+        logger.info(f"🔧 [Session {session_id}] CrossTurnPenalty enabled: "
               f"penalty={args.cross_turn_penalty}, window={args.cross_turn_lookback}, "
               f"ngram_sizes={args.cross_turn_ngram_sizes}")
 
@@ -829,7 +834,7 @@ async def handle_client_connection_async(conn, addr, args):
 
             # Sanity check for length (prevent memory issues)
             if file_len > 100 * 1024 * 1024:  # 100MB max
-                print(f"⚠ Invalid length {file_len}, skipping message")
+                logger.warning(f"⚠ Invalid length {file_len}, skipping message")
                 continue
 
             file_data = await _read_payload(conn, file_len)
@@ -856,11 +861,11 @@ async def handle_client_connection_async(conn, addr, args):
     except Exception as e:
         # Top-level catch for the per-connection handler: anything uncaught
         # would drop the connection without a clean finally; keep broad.
-        print(f"❌ Connection error: {e}")
+        logger.error(f"❌ Connection error: {e}")
         import traceback
         traceback.print_exc()
     finally:
-        print(f"👋 Connection closed by {addr}")
+        logger.info(f"👋 Connection closed by {addr}")
 
         # Cleanup
         async with session_lock:
@@ -1027,61 +1032,61 @@ async def main_async(args):
         try:
             with open(args.debug_context_file, "w", encoding="utf-8") as f:
                 pass
-            print(f"🗑 [Debug] Cleared context file on server start: {args.debug_context_file}")
+            logger.info(f"🗑 [Debug] Cleared context file on server start: {args.debug_context_file}")
         except OSError as e:
-            print(f"⚠️ [Debug] Failed to clear context file: {e}")
+            logger.warning(f"⚠️ [Debug] Failed to clear context file: {e}")
 
     # 根据 model path 动态设置 SILENT_TOKEN_ID
     setup_silent_token_id(args.model)
 
     model_type = detect_model_type(args.model)
-    print("=" * 60)
-    print(f"Qwen3 {'Omni' if model_type == 'omni' else 'VL'} Streaming Input Server")
-    print("=" * 60)
-    print(f"Mode: {'HTTP API' if args.use_http_api else 'Embedded Engine'}")
-    print(f"Model: {args.model} (type: {model_type})")
-    print(f"Listen Port: {args.listen_port}")
-    print("-" * 60)
-    print("Streaming Configuration:")
-    print(f"  Target FPS: {args.target_fps} (frames extracted per second)")
-    print(f"  Max Streaming Images: {args.max_streaming_images}")
-    print(f"  Max Images Per Prompt: {args.max_images_per_prompt}")
-    print(f"  Min Yield Interval: {args.min_yield_interval}s (throttling)")
-    print(f"  Note: Client records at 15fps, server extracts at {args.target_fps}fps")
-    print(f"  Capacity: ~{int(args.max_streaming_images / args.target_fps / 60)} minutes of video")
-    print(f"  Video resize: {'ENABLED (1/8 resolution)' if args.video_resize else 'DISABLED (full res)'}")
-    print(f"  Enable pruning: {'ENABLED' if args.enable_pruning else 'DISABLED'}")
-    print(f"  Num rounds keep: {args.num_rounds_keep}")
-    print(f"  Max rounds: {args.max_rounds}")
-    print(f"  Max context QAs: {args.max_context_qas}")
-    print(f"  Enable expert parallel: {'ENABLED' if args.enable_expert_parallel else 'DISABLED'}")
+    logger.info("=" * 60)
+    logger.info(f"Qwen3 {'Omni' if model_type == 'omni' else 'VL'} Streaming Input Server")
+    logger.info("=" * 60)
+    logger.info(f"Mode: {'HTTP API' if args.use_http_api else 'Embedded Engine'}")
+    logger.info(f"Model: {args.model} (type: {model_type})")
+    logger.info(f"Listen Port: {args.listen_port}")
+    logger.info("-" * 60)
+    logger.info("Streaming Configuration:")
+    logger.info(f"  Target FPS: {args.target_fps} (frames extracted per second)")
+    logger.info(f"  Max Streaming Images: {args.max_streaming_images}")
+    logger.info(f"  Max Images Per Prompt: {args.max_images_per_prompt}")
+    logger.info(f"  Min Yield Interval: {args.min_yield_interval}s (throttling)")
+    logger.info(f"  Note: Client records at 15fps, server extracts at {args.target_fps}fps")
+    logger.info(f"  Capacity: ~{int(args.max_streaming_images / args.target_fps / 60)} minutes of video")
+    logger.info(f"  Video resize: {'ENABLED (1/8 resolution)' if args.video_resize else 'DISABLED (full res)'}")
+    logger.info(f"  Enable pruning: {'ENABLED' if args.enable_pruning else 'DISABLED'}")
+    logger.info(f"  Num rounds keep: {args.num_rounds_keep}")
+    logger.info(f"  Max rounds: {args.max_rounds}")
+    logger.info(f"  Max context QAs: {args.max_context_qas}")
+    logger.info(f"  Enable expert parallel: {'ENABLED' if args.enable_expert_parallel else 'DISABLED'}")
     if args.kv_offloading_size is not None:
-        print(f"  KV Offloading Size: {args.kv_offloading_size} GB")
+        logger.info(f"  KV Offloading Size: {args.kv_offloading_size} GB")
     if args.mm_encoder_attn_backend is not None:
-        print(f"  MM Encoder Attention Backend: {args.mm_encoder_attn_backend}")
+        logger.info(f"  MM Encoder Attention Backend: {args.mm_encoder_attn_backend}")
     if args.mm_encoder_tp_mode is not None:
-        print(f"  MM Encoder TP Mode: {args.mm_encoder_tp_mode}")
+        logger.info(f"  MM Encoder TP Mode: {args.mm_encoder_tp_mode}")
     if args.disable_hybrid_kv_cache_manager:
-        print(f"  Hybrid KV Cache Manager: DISABLED")
+        logger.info(f"  Hybrid KV Cache Manager: DISABLED")
     if args.block_size is not None:
-        print(f"  Block size: {args.block_size}")
+        logger.info(f"  Block size: {args.block_size}")
     if args.cache_dtype is not None:
-        print(f"  Cache dtype: {args.cache_dtype}")
+        logger.info(f"  Cache dtype: {args.cache_dtype}")
     if args.prefix_caching_hash_algo is not None:
-        print(f"  Prefix caching hash algo: {args.prefix_caching_hash_algo}")
+        logger.info(f"  Prefix caching hash algo: {args.prefix_caching_hash_algo}")
     if args.max_num_batched_tokens is not None:
-        print(f"  Max num batched tokens: {args.max_num_batched_tokens}")
+        logger.info(f"  Max num batched tokens: {args.max_num_batched_tokens}")
     if args.enable_tts:
-        print(f"  TTS Enabled: service at {args.tts_service_url}")
-    print("=" * 60)
+        logger.info(f"  TTS Enabled: service at {args.tts_service_url}")
+    logger.info("=" * 60)
 
     # Initialize TTS if enabled
     if args.enable_tts:
         if tts_ctl.configure(args):
             tts_ctl.start_worker(args)
         else:
-            print("⚠ TTS initialization failed, TTS will be disabled")
-    # print("⚠ TTS initialization failed, TTS will be disabled")
+            logger.warning("⚠ TTS initialization failed, TTS will be disabled")
+    # logger.warning("⚠ TTS initialization failed, TTS will be disabled")
 
     if not args.use_http_api:
         # Initialize embedded engine
@@ -1090,25 +1095,33 @@ async def main_async(args):
     # Run TCP accept loop in the same event loop as the engine (fixes TTFT ~800ms delay
     # caused by engine and connection handler living in different loops).
     server_sock = _create_listen_socket(args.listen_port)
-    print(f"🌐 Server listening on port {args.listen_port}")
+    logger.info(f"🌐 Server listening on port {args.listen_port}")
     asyncio.create_task(run_accept_loop(server_sock, args))
 
-    print("✅ Server started. Press Ctrl+C to exit.")
+    logger.info("✅ Server started. Press Ctrl+C to exit.")
 
     # Keep main thread alive
     try:
         while True:
             await asyncio.sleep(1)
     except KeyboardInterrupt:
-        print("\n👋 Shutting down...")
+        logger.info("\n👋 Shutting down...")
 
 
 def main():
     args = parse_args()
 
+    # Configure root logging once at entry. Other modules (aura.*) that
+    # use `logging.getLogger(...)` inherit this setup; keep format
+    # compatible with the Flask bridge in realtime_capture_video_audio_streaming.py.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
     # Handle signals
     def signal_handler(sig, frame):
-        print("\n👋 Received shutdown signal")
+        logger.info("\n👋 Received shutdown signal")
         exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
