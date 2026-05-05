@@ -39,6 +39,7 @@ import os
 import signal
 import socket
 import struct
+import tempfile
 import threading
 import time
 from collections import Counter
@@ -663,35 +664,17 @@ async def handle_client_connection_async(conn, addr, args):
 
                 # Downsample video to target FPS and get as numpy array with metadata
                 print("🎥 Processing video data...")
-                timestamp = int(time.time() * 1000)
-                input_path = f"/tmp/video_{timestamp}_input.webm"
-                
-                with open(input_path, "wb") as f:
-                    f.write(file_data)
-                
-                # Downsample video and get (numpy_array, metadata) tuple
-                video_array, metadata = downsample_video_to_numpy(input_path, target_fps=args.target_fps)
-                
-                # Clean up input file
-                try:
-                    os.remove(input_path)
-                except:
-                    pass
+                with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
+                    tmp.write(file_data)
+                    input_path = tmp.name
 
-                # # Run video decode in executor to avoid blocking the event loop (prevents TTFT starvation).
-                # print("🎥 Processing video data...")
-                # timestamp = int(time.time() * 1000)
-                # input_path = f"/tmp/video_{timestamp}_input.webm"
-                # print("New......")
-                # loop = asyncio.get_event_loop()
-                # video_array, metadata = await loop.run_in_executor(
-                #     None,
-                #     _decode_video_sync,
-                #     file_data,
-                #     input_path,
-                #     args.target_fps,
-                #     not args.no_video_resize,
-                # )
+                try:
+                    video_array, metadata = downsample_video_to_numpy(input_path, target_fps=args.target_fps)
+                finally:
+                    try:
+                        os.remove(input_path)
+                    except OSError:
+                        pass
 
                 if video_array is not None:
                     # Accumulate video frames (as numpy arrays)
