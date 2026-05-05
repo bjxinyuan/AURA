@@ -19,6 +19,7 @@ import traceback
 
 import requests
 from aura.server_io import send_audio, send_audio_chunk
+from aura.text_utils import remove_markdown
 
 
 # ---------------------------------------------------------------
@@ -209,10 +210,6 @@ class TTSController:
         """
         if not sentence or not sentence.strip():
             return
-
-        # Lazy import: context_manage pulls in cv2, which shouldn't be required
-        # just to instantiate a TTSController (e.g. in unit tests).
-        from context_manage import remove_markdown
 
         clean_text = remove_markdown(sentence)
         if not clean_text.strip():

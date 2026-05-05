@@ -62,7 +62,7 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.v1.engine.async_llm import AsyncLLM, StreamingInput
 
 # Context management (reuse remove_markdown for TTS)
-from context_manage import remove_markdown
+from aura.text_utils import remove_markdown
 
 # Extracted modules (see aura/)
 from aura.session_history import SessionHistory, SILENT_TEXT
