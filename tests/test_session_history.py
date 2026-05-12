@@ -182,3 +182,106 @@ def test_save_context_debug_noop_when_file_unset():
     h = SessionHistory(debug_context_file=None)
     h.add_user_message("x")
     h.save_context_debug(request_id="ignored")  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Omni E2E audio support
+# ---------------------------------------------------------------------------
+
+def test_add_user_with_audio_tuple_emits_audio_tokens():
+    h = SessionHistory()
+    fake_audio = ("waveform_placeholder", 16000)
+    h.add_user_message("", audio_tuple=fake_audio)
+    out = h.get_vllm_inputs()
+    assert "<|audio_start|><|audio_pad|><|audio_end|>" in out["prompt"]
+    assert out["multi_modal_data"].get("audio") == [fake_audio]
+    assert h.current_rounds == 1
+
+
+def test_add_user_with_video_and_audio_emits_both():
+    h = SessionHistory()
+    fake_video = ("video_placeholder", {"fps": 2.0})
+    fake_audio = ("waveform_placeholder", 16000)
+    h.add_user_message("", video_tuple=fake_video, audio_tuple=fake_audio)
+    out = h.get_vllm_inputs()
+    assert "<|vision_start|><|video_pad|><|vision_end|>" in out["prompt"]
+    assert "<|audio_start|><|audio_pad|><|audio_end|>" in out["prompt"]
+    assert out["multi_modal_data"].get("video") == [fake_video]
+    assert out["multi_modal_data"].get("audio") == [fake_audio]
+
+
+def test_replace_audio_with_text_drops_audio_from_multi_modal():
+    """After rewrite, the user message no longer contributes an audio entry."""
+    h = SessionHistory()
+    h.add_user_message("", audio_tuple=("wav", 16000))
+    h.replace_last_user_audio_with_text("今天天气怎么样")
+
+    out = h.get_vllm_inputs()
+    assert "audio" not in out["multi_modal_data"]
+    assert "<|audio_start|>" not in out["prompt"]
+    assert "今天天气怎么样" in out["prompt"]
+
+
+def test_replace_audio_preserves_video_in_same_turn():
+    """A turn with both video + audio: rewrite drops only audio."""
+    h = SessionHistory()
+    fake_video = ("video", {"fps": 2.0})
+    h.add_user_message("", video_tuple=fake_video, audio_tuple=("wav", 16000))
+    h.replace_last_user_audio_with_text("hello")
+
+    out = h.get_vllm_inputs()
+    # Video survives.
+    assert "<|video_pad|>" in out["prompt"]
+    assert out["multi_modal_data"]["video"] == [fake_video]
+    # Audio gone, text added.
+    assert "audio" not in out["multi_modal_data"]
+    assert "hello" in out["prompt"]
+
+
+def test_replace_audio_noop_when_no_audio():
+    """Calling rewrite on a video-only turn does nothing harmful."""
+    h = SessionHistory()
+    h.add_user_message("", video_tuple=("v", {"fps": 2.0}))
+    h.replace_last_user_audio_with_text("transcribed")
+
+    out = h.get_vllm_inputs()
+    # Transcription should NOT have been appended since there was no audio.
+    assert "transcribed" not in out["prompt"]
+
+
+def test_replace_audio_with_empty_transcription_just_drops_audio():
+    """Empty transcription = drop audio, don't insert empty text item."""
+    h = SessionHistory()
+    h.add_user_message("", audio_tuple=("wav", 16000))
+    h.replace_last_user_audio_with_text("")
+
+    out = h.get_vllm_inputs()
+    assert "audio" not in out["multi_modal_data"]
+    assert "<|audio_start|>" not in out["prompt"]
+
+
+def test_pruning_strips_audio_when_moved_to_context_history():
+    """Audio entries that survive into a pruned round must be stripped
+    (rewrite rule A extended)."""
+    h = SessionHistory(max_rounds=2, num_rounds_keep=1, pruning_enabled=True)
+    # Round 1: user with audio (intentionally NOT rewritten — simulating
+    # the case where the rewrite was skipped, e.g. silent response path).
+    h.add_user_message("", audio_tuple=("wav1", 16000))
+    h.add_assistant_message("a1")
+    # Round 2: another audio turn
+    h.add_user_message("", audio_tuple=("wav2", 16000))
+    h.add_assistant_message("a2")
+    # Round 3: triggers pruning (sw_rounds=3 > max_rounds=2)
+    h.add_user_message("", audio_tuple=("wav3", 16000))
+    h.add_assistant_message("a3")
+
+    # context_history should not contain any audio entries — Rule A strips
+    # all multimedia placeholders. (Existing _extract_user_text returns "" for
+    # audio-only content; that's fine, the round either becomes truncated and
+    # gets merged, or just becomes a "" user message.)
+    for qa in h._context_history:
+        for msg in qa:
+            content = msg.get("content")
+            if isinstance(content, list):
+                for item in content:
+                    assert not (isinstance(item, dict) and item.get("type") == "audio")

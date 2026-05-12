@@ -46,9 +46,6 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
-import aiohttp
-import requests
-import re  # Added for TTS sentence splitting
 
 from datetime import datetime
 
@@ -72,6 +69,8 @@ from aura.server_io import (
 )
 from aura.tts import TTSController
 from aura.media import downsample_video_to_numpy
+from aura.audio_media import decode_audio_to_numpy
+from aura.query_extractor import QueryExtractor
 
 # Global configuration
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -176,82 +175,17 @@ def generate_response_id() -> str:
 
 
 # ============================================================================
-# ASR (Automatic Speech Recognition)
+# Audio (Qwen3-Omni E2E mode)
 # ============================================================================
-
-def get_audio_prompt(audio_path: str, asr_url: str) -> str:
-    """
-    Transcribe audio file to text using ASR service (synchronous version).
-
-    Args:
-        audio_path: Path to the audio file (MP3, WAV, etc.)
-        asr_url: URL of the ASR service
-
-    Returns:
-        Transcribed text, or empty string if failed
-    """
-    logger.info(f"🎤 Transcribing audio from {audio_path}...")
-    try:
-        with open(audio_path, 'rb') as f:
-            files = {'file': f}
-            # Request only ASR, do not trigger vLLM in ASR service
-            response = requests.post(asr_url, files=files, params={"run_vllm": "false"}, timeout=30)
-
-        if response.status_code == 200:
-            data = response.json()
-            text = data.get("text", "")
-            logger.info(f"✅ Transcribed: {text!r}")
-            return text
-        else:
-            logger.error(f"❌ ASR failed with status {response.status_code}: {response.text}")
-            return ""
-    except requests.exceptions.Timeout:
-        logger.error("❌ ASR request timeout")
-        return ""
-    except requests.RequestException as e:
-        logger.error(f"❌ ASR error: {e}")
-        return ""
-
-
-async def transcribe_audio_async(audio_path: str, asr_url: str) -> str:
-    """
-    Transcribe audio file to text using ASR service (asynchronous version).
-
-    Args:
-        audio_path: Path to the audio file (MP3, WAV, etc.)
-        asr_url: URL of the ASR service
-
-    Returns:
-        Transcribed text, or empty string if failed
-    """
-    logger.info(f"🎤 [Async] Transcribing audio from {audio_path}...")
-    try:
-        async with aiohttp.ClientSession() as session:
-            with open(audio_path, 'rb') as f:
-                data = aiohttp.FormData()
-                data.add_field('file', f, filename=os.path.basename(audio_path))
-
-                async with session.post(
-                    asr_url,
-                    data=data,
-                    params={"run_vllm": "false"},
-                    timeout=aiohttp.ClientTimeout(total=30)
-                ) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        text = result.get("text", "")
-                        logger.info(f"✅ [Async] Transcribed: {text!r}")
-                        return text
-                    else:
-                        error_text = await response.text()
-                        logger.error(f"❌ [Async] ASR failed with status {response.status}: {error_text}")
-                        return ""
-    except asyncio.TimeoutError:
-        logger.error("❌ [Async] ASR request timeout")
-        return ""
-    except aiohttp.ClientError as e:
-        logger.error(f"❌ [Async] ASR error: {e}")
-        return ""
+#
+# Audio transcription is no longer a separate service call. Browser-recorded
+# blobs are decoded to numpy waveform via aura.audio_media.decode_audio_to_numpy
+# and fed directly to the model alongside video. The model produces the
+# transcription as a <query>...</query> prefix in its response, parsed
+# out of the token stream by aura.query_extractor.QueryExtractor.
+#
+# (The old aiohttp/requests ASR plumbing was removed when the standalone
+# Qwen3_asr_serve.py service was deleted — see arch.md migration notes.)
 
 
 # TTS pipeline moved to aura/tts.py — see `ctx.tts_ctl` above.
@@ -346,15 +280,24 @@ async def generate_response_with_video(
     prompt: str,
     sampling_params: SamplingParams,
     args = None,
+    audio_tuple: tuple = None,
 ):
     """
-    Generate response for a single turn using video input.
-    Qwen3-VL expects video as (numpy_array, metadata_dict) tuple.
+    Generate response for a single turn using video (and optionally audio) input.
+
+    Qwen3-VL/Omni expects video as (numpy_array, metadata_dict) tuple.
+    For Qwen3-Omni E2E mode, audio_tuple = (waveform, sample_rate) is passed
+    alongside the video; the model is prompted to emit a <query>...</query>
+    transcription prefix which is parsed by QueryExtractor and:
+      - sent to the client as a Type 10 echo (so the user sees "what they said")
+      - written back into SessionHistory in place of the raw waveform (so
+        subsequent turns are prefix-cache friendly and bounded in context)
 
     Args:
         video_tuple: Tuple of (numpy_array, metadata_dict)
                     numpy_array shape: (num_frames, height, width, 3)
                     metadata_dict: {"fps": float, "duration": float, ...}
+        audio_tuple: Optional (waveform, sample_rate) for E2E audio.
     """
     logger.info(f"==== Calling generate_response_with_video() ====")
 
@@ -381,14 +324,13 @@ async def generate_response_with_video(
     request_id = ""
     streaming_started = False
     try:
-        # Add current turn to history with video tuple
-        session.history.add_user_message(prompt, video_tuple=video_tuple)
+        # Add current turn to history with video tuple (and audio if E2E mode).
+        session.history.add_user_message(
+            prompt, video_tuple=video_tuple, audio_tuple=audio_tuple,
+        )
 
         # Get vLLM inputs (with history for Prefix Caching)
-        # t_get_inputs_start = time.time()
         vllm_inputs = session.history.get_vllm_inputs()
-        # t_get_inputs_end = time.time()
-        # logger.info(f"⏱️ [TIMING] get_vllm_inputs() took {(t_get_inputs_end - t_get_inputs_start)*1000:.1f}ms")
 
         # Generate unique request ID for this turn
         request_id = generate_response_id()
@@ -397,7 +339,8 @@ async def generate_response_with_video(
 
         video_array, video_metadata = video_tuple
         logger.info(f"🎬 [Session {session.session_id}] Starting generation (request_id={request_id})")
-        logger.info(f"📥 Input: {video_array.shape[0]} video frames ({video_array.shape}), prompt='{prompt}'")
+        logger.info(f"📥 Input: {video_array.shape[0]} video frames ({video_array.shape}), "
+                    f"audio={'yes' if audio_tuple else 'no'}, prompt='{prompt}'")
 
         full_response = ""
         previous_text = ""
@@ -406,8 +349,18 @@ async def generate_response_with_video(
 
         tts_enabled_for_this_response = args and args.enable_tts and ctx.tts_ctl.enabled
 
-        if tts_enabled_for_this_response and prompt:
+        # Clear TTS queue when a user-driven turn starts (audio or typed prompt).
+        if tts_enabled_for_this_response and (prompt or audio_tuple is not None):
             ctx.tts_ctl.clear_queue(new_response_id=request_id)
+
+        # QueryExtractor: only active when this turn carries user audio. For
+        # video-only auto-generation the model isn't prompted to emit
+        # <query>...</query>, so we skip extraction and forward everything.
+        query_extractor = None
+        if audio_tuple is not None:
+            max_chars = getattr(args, "query_echo_max_chars", 80) if args else 80
+            query_extractor = QueryExtractor(max_chars_before_fallback=max_chars)
+            logger.info(f"🔎 [QueryExtractor] enabled (max_chars_before_fallback={max_chars})")
 
         # Timing measurements
         generation_start_time = time.time()
@@ -423,6 +376,41 @@ async def generate_response_with_video(
         _COMMA_ENDS = frozenset("，,")
         _TTS_MIN_CHARS = 10
         streaming_started = False
+
+        def _emit_passthrough(text_piece: str):
+            """Forward a delta of post-<query> text to client + TTS buffer.
+
+            Wrapped as a closure so both the streaming loop and the
+            QueryExtractor passthrough path share identical sentence
+            splitting and token-streaming behavior.
+            """
+            nonlocal _tts_sentence_buf, _tts_sentence_idx, streaming_started
+            if not text_piece:
+                return
+            if not streaming_started:
+                send_streaming_token(session, text_piece, request_id, is_start=True)
+                streaming_started = True
+            else:
+                send_streaming_token(session, text_piece, request_id)
+
+            if tts_enabled_for_this_response:
+                _tts_sentence_buf += text_piece
+                while _tts_sentence_buf:
+                    split_pos = -1
+                    for i, ch in enumerate(_tts_sentence_buf):
+                        if ch in _SENT_ENDS:
+                            split_pos = i + 1
+                            break
+                        if ch in _COMMA_ENDS and i + 1 >= _TTS_MIN_CHARS:
+                            split_pos = i + 1
+                            break
+                    if split_pos < 0:
+                        break
+                    sentence = _tts_sentence_buf[:split_pos]
+                    _tts_sentence_buf = _tts_sentence_buf[split_pos:]
+                    if sentence.strip():
+                        ctx.tts_ctl.enqueue_sentence(sentence, session, request_id, _tts_sentence_idx, args)
+                        _tts_sentence_idx += 1
 
         # ===== Streaming generation: send tokens to frontend as they arrive =====
         async for response in ctx.async_engine.generate(
@@ -452,34 +440,35 @@ async def generate_response_with_video(
                     if len(current_text) > len(previous_text):
                         delta = current_text[len(previous_text):]
                         previous_text = current_text
-                        full_response += delta
 
-                        # --- Stream delta to frontend ---
-                        if not streaming_started:
-                            send_streaming_token(session, delta, request_id, is_start=True)
-                            streaming_started = True
+                        if query_extractor is not None:
+                            result = query_extractor.feed(delta)
+                            if result.query_complete:
+                                # Echo transcription to client + rewrite history.
+                                logger.info(
+                                    f"🔎 [QueryExtractor] query='{result.query_text[:60]}' "
+                                    f"(fallback={result.fallback_triggered})"
+                                )
+                                send_asr_query(session, result.query_text)
+                                session.history.replace_last_user_audio_with_text(result.query_text)
+                            # Whatever survived <query> goes to passthrough.
+                            _emit_passthrough(result.passthrough_delta)
+                            full_response += result.passthrough_delta
                         else:
-                            send_streaming_token(session, delta, request_id)
+                            full_response += delta
+                            _emit_passthrough(delta)
 
-                        # --- Incremental TTS sentence detection ---
-                        if tts_enabled_for_this_response:
-                            _tts_sentence_buf += delta
-                            while _tts_sentence_buf:
-                                split_pos = -1
-                                for i, ch in enumerate(_tts_sentence_buf):
-                                    if ch in _SENT_ENDS:
-                                        split_pos = i + 1
-                                        break
-                                    if ch in _COMMA_ENDS and i + 1 >= _TTS_MIN_CHARS:
-                                        split_pos = i + 1
-                                        break
-                                if split_pos < 0:
-                                    break
-                                sentence = _tts_sentence_buf[:split_pos]
-                                _tts_sentence_buf = _tts_sentence_buf[split_pos:]
-                                if sentence.strip():
-                                    ctx.tts_ctl.enqueue_sentence(sentence, session, request_id, _tts_sentence_idx, args)
-                                    _tts_sentence_idx += 1
+        # If the stream ended while still inside <query>, finalize so the
+        # client gets *some* echo and history doesn't keep the audio blob.
+        if query_extractor is not None:
+            final = query_extractor.finalize()
+            if final.query_complete and final.fallback_triggered:
+                logger.warning(
+                    f"⚠️ [QueryExtractor] decode ended without </query>; "
+                    f"fallback echo='{(final.query_text or '')[:60]}'"
+                )
+                send_asr_query(session, final.query_text or "")
+                session.history.replace_last_user_audio_with_text(final.query_text or "")
 
         # ===== Generation finished — decide: silent / send =====
         generation_end_time = time.time()
@@ -501,6 +490,11 @@ async def generate_response_with_video(
 
         if is_silent_response:
             logger.info(f"🔇 [DECISION] → MODEL_SILENT (first token was silent/im_end)")
+            # Audio turn that the model deemed silent: still drop the waveform
+            # from history (rewrite to empty text) so subsequent turns aren't
+            # poisoned by a stale audio entry.
+            if audio_tuple is not None:
+                session.history.replace_last_user_audio_with_text("")
             session.history.add_assistant_message(SILENT_TEXT)
             send_streaming_token(session, SILENT_TEXT, request_id, is_final=True, is_silent=True)
             if session.cross_turn_penalty is not None:
@@ -509,6 +503,9 @@ async def generate_response_with_video(
         else:
             # Send final marker to frontend (content already streamed)
             send_streaming_token(session, "", request_id, is_final=True)
+            # Note: full_response excludes the <query>...</query> prefix — only
+            # the assistant's actual reply is recorded for cross-turn penalty
+            # and history continuity.
             session.history.add_assistant_message(full_response)
             if session.cross_turn_penalty is not None:
                 session.cross_turn_penalty.record(full_response)
@@ -622,6 +619,7 @@ def _reset_session_state(session: StreamingSession, reason: str):
         session.cross_turn_penalty.reset()
     session.accumulated_video_frames = []
     session.last_prompt = ""
+    session.pending_audio = None
 
 
 def _decode_webm_to_frames(file_data: bytes, args) -> Optional[tuple]:
@@ -649,15 +647,19 @@ def _decode_webm_to_frames(file_data: bytes, args) -> Optional[tuple]:
 
 
 def _maybe_launch_generation(session: StreamingSession, args):
-    """If we have enough accumulated frames (or a pending user prompt),
+    """If we have enough accumulated frames (or pending audio / typed prompt),
     concatenate them, build sampling params, and launch the generation
-    background task. Clears accumulated frames once the task is scheduled."""
+    background task. Clears accumulated frames and pending audio once the
+    task is scheduled."""
     total_frames = sum(arr.shape[0] for arr in session.accumulated_video_frames)
+    has_audio = session.pending_audio is not None
+    has_typed_prompt = bool(session.last_prompt)
 
     should_process = False
-    # Priority trigger: pending user prompt.
-    if session.last_prompt and total_frames > 0:
-        logger.info(f"⚡ Triggering immediate generation for user prompt (frames={total_frames})")
+    # Priority trigger: pending user input (audio or typed text) + frames.
+    if (has_audio or has_typed_prompt) and total_frames > 0:
+        trigger_kind = "audio" if has_audio else "prompt"
+        logger.info(f"⚡ Triggering immediate generation for user {trigger_kind} (frames={total_frames})")
         should_process = True
     # Background trigger: have enough frames and the task is idle.
     elif total_frames >= 2 and not session.is_generating:
@@ -667,8 +669,8 @@ def _maybe_launch_generation(session: StreamingSession, args):
     if not should_process:
         return
     if session.is_generating:
-        if session.last_prompt:
-            logger.info("⏳ Waiting for previous generation to finish before processing prompt...")
+        if has_audio or has_typed_prompt:
+            logger.info("⏳ Waiting for previous generation to finish before processing user input...")
         return
 
     # Concatenate all accumulated frames.
@@ -700,7 +702,12 @@ def _maybe_launch_generation(session: StreamingSession, args):
 
     current_prompt = session.last_prompt
     session.last_prompt = ""
-    session.is_auto_generating = (current_prompt == "")
+    current_audio = session.pending_audio
+    session.pending_audio = None
+    # "auto-generation" = background trigger with no user voice or typed
+    # prompt. Used to decide whether a future audio arrival can preempt
+    # this task.
+    session.is_auto_generating = (current_audio is None and current_prompt == "")
 
     penalty_kwargs = {}
     if session.cross_turn_penalty is not None:
@@ -717,7 +724,8 @@ def _maybe_launch_generation(session: StreamingSession, args):
         video_tuple,
         current_prompt,
         sampling_params,
-        args
+        args,
+        audio_tuple=current_audio,
     ))
 
 
@@ -740,44 +748,43 @@ def _handle_video_msg(file_data: bytes, session: StreamingSession, args):
 
 
 async def _handle_audio_msg(file_data: bytes, session: StreamingSession, args):
-    """Persist audio, run ASR, and set session.last_prompt. If a previous
-    auto-generation is still running, cancel it so the user prompt can
-    take precedence."""
-    audio_path = os.path.join(AUDIO_DIR, "latest.mp3")
+    """Persist audio, decode to waveform, stash on session, and preempt
+    any in-flight auto-generation so the user's voice gets first turn.
+
+    Unlike the old ASR flow, this does NOT call out to any external
+    service — the waveform is fed to Qwen3-Omni directly, and the model
+    produces a <query>...</query> transcription prefix that the
+    generation loop parses out (see QueryExtractor). The ASR query echo
+    to the client (Type 10) is therefore delayed until the model emits
+    </query>, not sent immediately.
+    """
+    audio_path = os.path.join(AUDIO_DIR, "latest.webm")
     os.makedirs(AUDIO_DIR, exist_ok=True)
     with open(audio_path, "wb") as f:
         f.write(file_data)
     logger.info(f"🎤 Saved audio to {audio_path}")
 
-    _asr_start = time.time()
-    if args.asr_sync:
-        loop = asyncio.get_event_loop()
-        transcribed_text = await loop.run_in_executor(
-            None, get_audio_prompt, audio_path, args.asr_url
-        )
-    else:
-        transcribed_text = await transcribe_audio_async(audio_path, args.asr_url)
-    _asr_end = time.time()
-    logger.info(f"⏱️ [TIMING] ASR latency: {(_asr_end - _asr_start)*1000:.1f}ms")
+    _decode_start = time.time()
+    loop = asyncio.get_event_loop()
+    waveform, sr = await loop.run_in_executor(
+        None, decode_audio_to_numpy, audio_path
+    )
+    _decode_end = time.time()
+    logger.info(f"⏱️ [TIMING] Audio decode latency: {(_decode_end - _decode_start)*1000:.1f}ms")
 
-    if not transcribed_text:
-        logger.warning("⚠ ASR returned empty, will use default prompt")
+    if waveform is None:
+        logger.warning("⚠ Audio decode failed, skipping")
         return
 
-    session.last_prompt = transcribed_text
-    logger.info(f"📝 Set prompt from ASR: {session.last_prompt[:50]}...")
+    session.pending_audio = (waveform, sr)
+    logger.info(f"📝 Set pending audio: {waveform.shape[0]} samples @ {sr}Hz "
+                f"({waveform.shape[0] / sr:.2f}s)")
 
-    # Plan 2: ASR query is sent to client immediately; model inference
-    # result will be sent separately later.
-    send_asr_query(session, transcribed_text)
-
-    # Optimization: try to trigger immediately if we have any video frames.
-    if session.accumulated_video_frames:
-        logger.info("🚀 Audio arrived, attempting immediate trigger...")
-        if session.is_generating and session.is_auto_generating:
-            if session.current_task and not session.current_task.done():
-                logger.info("🛑 Interrupting auto-generation for user prompt (from Audio event)!")
-                session.current_task.cancel()
+    # Preempt any in-flight auto-generation so the voice turn gets priority.
+    if session.is_generating and session.is_auto_generating:
+        if session.current_task and not session.current_task.done():
+            logger.info("🛑 Interrupting auto-generation for user audio turn!")
+            session.current_task.cancel()
 
 
 async def handle_client_connection_async(conn, addr, args):
@@ -973,11 +980,10 @@ def parse_args():
     parser.add_argument("--use-http-api", action="store_true",
                         help="Use HTTP API instead of embedded engine")
 
-    # ASR configuration
-    parser.add_argument("--asr-url", type=str, default="http://localhost:8001/asr",
-                        help="ASR service URL")
-    parser.add_argument("--asr-sync", action="store_true",
-                        help="Use synchronous ASR (default: async). Use sync mode if async has issues.")
+    # Qwen3-Omni E2E audio / QueryExtractor configuration
+    parser.add_argument("--query-echo-max-chars", type=int, default=80,
+                        help="Max chars of model output before QueryExtractor gives up "
+                             "waiting for </query> and falls back to echoing whatever accumulated")
 
     # Streaming configuration
     parser.add_argument("--frame-buffer-size", type=int, default=8,
@@ -1136,6 +1142,12 @@ def main():
 if __name__ == "__main__":
     main()
 
-# CUDA_VISIBLE_DEVICES=1,2,3,4,5 python Qwen3_VL_online_streaming.py --listen-port 12345 --model $AURA_MODEL_PATH --tensor-parallel-size 4 --max-model-len 128000 --gpu-memory-utilization 0.85 --asr-url http://localhost:8001/asr --kv-offloading-size 300 --disable-hybrid-kv-cache-manager --mm-encoder-attn-backend FLASH_ATTN --mm-encoder-tp-mode data --enable-tts --tts-gpu 5 --tts-model Qwen/Qwen3-TTS-12Hz-1.7B-Base --tts-language Chinese --tts-ref-audio test_query.mp3 --tts-ref-text "仔细观察当前你看到的画面，并且结合之前你看到的画面，仔细描述你看到了什么" --tts-output-dir tts_results
+# Example launch (Qwen3-Omni FP8, single A800, TTS co-resident on GPU 0):
+# CUDA_VISIBLE_DEVICES=0 python Qwen3_VL_online_streaming_v2_ContextManaged.py \
+#     --listen-port 12345 --model $AURA_MODEL_PATH \
+#     --tensor-parallel-size 1 --max-model-len 131072 \
+#     --gpu-memory-utilization 0.80 --enable-expert-parallel \
+#     --kv-offloading-size 20 --mm-encoder-attn-backend FLASH_ATTN \
+#     --enable-tts --tts-service-url http://localhost:8002
 
 # ssh -L 5003:<remote-host>:5003 <user>@<gateway>

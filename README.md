@@ -47,7 +47,7 @@
 | Python | 3.12 |
 | PyTorch | 2.10+ with CUDA 12.8 |
 | vLLM | >= 0.17.1 (V1 engine with Automatic Prefix Caching) |
-| GPU | 2+ (minimum: 1 for ASR+TTS, 1 for AURA-8B inference) |
+| GPU | 1× A800 80GB (FP8 Qwen3-Omni + TTS co-resident). Multi-GPU also supported via `--tensor-parallel-size`. |
 | System | `ffmpeg`, `numactl` |
 | OS | Linux (tested on Ubuntu 22.04) |
 | Browser | Google Chrome (desktop or mobile) |
@@ -118,9 +118,10 @@ Download the following models from [Hugging Face](https://huggingface.co/):
 
 | Model | Purpose | Size |
 |-------|---------|------|
-| [AURA-8B](https://huggingface.co/aurateam/AURA/tree/main) | Main vision-language model | ~16 GB |
-| [Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B/tree/main) | Automatic Speech Recognition | ~3 GB |
+| [Qwen3-Omni-30B-A3B-FP8](https://huggingface.co/marksverdhei/Qwen3-Omni-30B-A3B-FP8) | End-to-end multimodal (audio + video + text) | ~30 GB |
 | [Qwen3-TTS-12Hz-1.7B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base/tree/main) | Text-to-Speech synthesis | ~4 GB |
+
+> **Why no ASR?** Qwen3-Omni ingests the user's audio directly. The transcription is recovered from a `<query>...</query>` prefix that the model emits at the start of its response — see `aura/query_extractor.py` and `arch.md` §5. The standalone ASR service that AURA-8B required has been removed.
 
 #### 2. Configure (optional)
 
@@ -133,29 +134,30 @@ cp .env.example .env
 set -a; source .env; set +a
 ```
 
-Defaults (when env is unset): Flask `5003`, ASR `8001`, TTS `8002`, inference `12345`, infer host `127.0.0.1`.
+Defaults (when env is unset): Flask `5003`, TTS `8002`, inference `12345`, infer host `127.0.0.1`.
 
 #### 3. One-Click Launch
 
 ```bash
-# Default: GPU 0 for ASR+TTS, GPU 1 for AURA inference
+# Default: GPU 0 for TTS + Qwen3-Omni inference (single-A800 co-resident)
 bash start_all.sh
 ```
 
 The script automatically:
-- Cleans up any leftover processes on the configured ports (defaults: 8001, 8002, 12345)
-- Starts ASR, TTS, and vLLM inference server in order
+- Cleans up any leftover processes on the configured ports (defaults: 8002, 12345)
+- Starts TTS and vLLM inference server in order
 - Waits for each service to be healthy before proceeding
-- Logs to `logs/asr.log`, `logs/tts.log`, `logs/vllm.log`
+- Logs to `logs/tts.log`, `logs/vllm.log`
 - `Ctrl+C` cleanly shuts down all services
 
 **Custom GPU allocation:**
 
 ```bash
-GPU_ASR=0 GPU_TTS=0 GPU_INFERENCE=1 bash start_all.sh
+# Separate cards for TTS and inference
+GPU_TTS=0 GPU_INFERENCE=1 bash start_all.sh
 
 # Multi-GPU inference (tensor parallel)
-GPU_ASR=0 GPU_TTS=0 GPU_INFERENCE=2,3 bash start_all.sh
+GPU_TTS=0 GPU_INFERENCE=2,3 bash start_all.sh
 ```
 
 #### 4. Launch Web Frontend
@@ -240,20 +242,7 @@ The interface has three buttons at the bottom of the screen:
 If you prefer to start services individually:
 
 <details>
-<summary><b>Step 1: ASR Service (Port 8001)</b></summary>
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python Qwen3_asr_serve.py \
-    --host 0.0.0.0 --port 8001 \
-    --model Qwen/Qwen3-ASR-1.7B \
-    --forced-aligner Qwen/Qwen3-ForcedAligner-0.6B \
-    --gpu-memory-utilization 0.3
-```
-
-</details>
-
-<details>
-<summary><b>Step 2: TTS Service (Port 8002)</b></summary>
+<summary><b>Step 1: TTS Service (Port 8002)</b></summary>
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 bash tts_service.sh
@@ -264,10 +253,10 @@ Verify: `curl http://localhost:8002/v1/tts/health`
 </details>
 
 <details>
-<summary><b>Step 3: Main Inference Server (Port 12345)</b></summary>
+<summary><b>Step 2: Main Inference Server (Port 12345)</b></summary>
 
 ```bash
-CUDA_VISIBLE_DEVICES=1 bash Qwen3_VL_online_streaming_v2_CM.sh
+CUDA_VISIBLE_DEVICES=0 bash Qwen3_VL_online_streaming_v2_CM.sh
 ```
 
 Wait for: `Server listening on port 12345`
@@ -275,7 +264,7 @@ Wait for: `Server listening on port 12345`
 </details>
 
 <details>
-<summary><b>Step 4: Web Frontend (Port 5003)</b></summary>
+<summary><b>Step 3: Web Frontend (Port 5003)</b></summary>
 
 ```bash
 python realtime_capture_video_audio_streaming.py
@@ -287,10 +276,17 @@ Open: `http://localhost:5003`
 
 ### GPU Allocation Reference
 
+Single A800 80GB (recommended):
+
 | GPU | Service | VRAM |
 |-----|---------|------|
-| GPU 0 | ASR (Qwen3-ASR-1.7B) + TTS (Qwen3-TTS-1.7B) | ~7 GB |
-| GPU 1 | AURA-8B inference (vLLM, TP=1) | ~16 GB |
+| GPU 0 | TTS (Qwen3-TTS-1.7B) + Qwen3-Omni-30B-A3B-FP8 inference (vLLM, TP=1) | ~38 GB weights + ~35-40 GB KV/activation budget |
+
+Multi-GPU (optional, for BF16 weights or larger context):
+
+```bash
+GPU_TTS=0 GPU_INFERENCE=1,2 bash start_all.sh   # TP=2 for inference
+```
 
 ### Key Configuration
 
@@ -301,7 +297,9 @@ and are overridden here.
 
 | Parameter | Script value | Description |
 |-----------|-------------|-------------|
-| `--max-model-len` | 262144 | Maximum context length (256K tokens) |
+| `--max-model-len` | 131072 | Maximum context length (128K tokens, sized for FP8 Omni on a single A800) |
+| `--gpu-memory-utilization` | 0.80 | Leaves headroom for co-resident TTS + encoder activations |
+| `--enable-expert-parallel` | on | MoE expert parallelism (required for Qwen3-Omni-30B-A3B) |
 | `--temperature` | 0.5 | Sampling temperature |
 | `--max-tokens` | 128 | Max tokens per response |
 | `--cross-turn-penalty` | 1 | Cross-turn repetition penalty strength |
@@ -309,27 +307,29 @@ and are overridden here.
 | `--enable-pruning` | on | Enable sliding-window context pruning |
 | `--max-rounds` | 45 | Trigger pruning when rounds exceed this |
 | `--num-rounds-keep` | 30 | Rounds to keep after pruning |
-| `--kv-offloading-size` | 10 | KV cache CPU offload size (GB) |
+| `--kv-offloading-size` | 20 | KV cache CPU offload size (GB) |
+| `--query-echo-max-chars` | 80 | Fallback threshold for `<query>...</query>` parser |
 
 ### Project Structure
 
 ```
 .
 ├── .env.example                              # Configuration template (ports, model path)
-├── start_all.sh                              # One-click launch script for ASR + TTS + inference
+├── start_all.sh                              # One-click launch script for TTS + inference
 ├── Qwen3_VL_online_streaming_v2_CM.sh        # Main inference launch script (argparse wiring)
 ├── Qwen3_VL_online_streaming_v2_ContextManaged.py  # Core: vLLM engine driver + TCP server
-├── Qwen3_asr_serve.py / asr_serve.sh         # ASR service (FastAPI + Qwen3-ASR)
 ├── tts_service.py / tts_service.sh           # TTS service (streaming synthesis)
 ├── realtime_capture_video_audio_streaming.py # Flask bridge between browser and inference (SSE + TCP)
 │
 ├── aura/                                     # Extracted modules (all unit-tested)
 │   ├── protocol.py                           #   Wire format: 9-byte header + message types
-│   ├── server_io.py                          #   Outbound token / audio-chunk / ASR-echo senders
+│   ├── server_io.py                          #   Outbound token / audio-chunk / query-echo senders
 │   ├── session.py                            #   StreamingSession dataclass (per-connection state)
-│   ├── session_history.py                    #   Sliding-window chat history with pruning
+│   ├── session_history.py                    #   Sliding-window chat history with pruning, audio rewrite
 │   ├── cross_turn_penalty.py                 #   n-gram penalty + logit bias against prior turns
 │   ├── media.py                              #   WebM → numpy video frame decoding
+│   ├── audio_media.py                        #   WebM/Opus → mono float32 @ 16 kHz waveform
+│   ├── query_extractor.py                    #   Streaming <query>...</query> prefix parser
 │   ├── tts.py                                #   TTSController: sentence queue + worker thread
 │   ├── sse.py                                #   Server-Sent Events framing for /api/events
 │   └── text_utils.py                         #   remove_markdown() for TTS-safe text
@@ -345,10 +345,11 @@ and are overridden here.
 │   ├── audio.js                              #   Mic capture + audio send + mic button wiring
 │   └── main.js                               #   onload + audio unlock
 │
-├── tests/                                    # 134 pytest cases (pure unit tests, no GPU needed)
+├── tests/                                    # ~165 pytest cases (pure unit tests, no GPU needed)
 │   ├── test_protocol.py / test_session.py / test_text_utils.py
 │   ├── test_session_history.py / test_cross_turn_penalty.py
-│   ├── test_media.py / test_server_io.py / test_sse.py / test_tts.py
+│   ├── test_media.py / test_audio_media.py / test_query_extractor.py
+│   ├── test_server_io.py / test_sse.py / test_tts.py
 │   └── conftest.py
 │
 ├── requirements.txt                          # Python dependencies for the demo server
@@ -368,21 +369,24 @@ source .venv/bin/activate
 python -m pytest tests/ -q
 ```
 
-All 134 tests should pass in a few seconds. They cover the wire
-protocol, session state, TTS controller state machine, SSE framing,
-video decoding, cross-turn penalty, history pruning, and server_io
-error isolation. This makes it safe to iterate on the Python side
-without spinning up an inference node.
+All 165+ tests should pass in a few seconds (7 audio-decode tests
+skip if `soundfile` is absent from your dev environment — they run
+in the deployment environment). They cover the wire protocol, session
+state, TTS controller state machine, SSE framing, video/audio decoding,
+cross-turn penalty, history pruning (including audio rewrite), the
+`<query>` prefix parser, and server_io error isolation. This makes it
+safe to iterate on the Python side without spinning up an inference node.
 
 ### Troubleshooting
 
 | Issue | Solution |
 |-------|----------|
 | `sched_setaffinity: Invalid argument` | Remove `numactl` from the launch script |
-| ASR returns empty text | Ensure the ASR service is running on port 8001 before starting the main server |
+| `<query>` fallback rate is high | Increase `--query-echo-max-chars`, or check that the system prompt reaches the model (inspect `debug_context.jsonl`) |
 | TTS voice clone fails | Verify the reference audio file exists in the working directory |
-| OOM on main GPU | Reduce `--gpu-memory-utilization` or `--max-model-len` |
+| OOM on main GPU | Reduce `--gpu-memory-utilization` or `--max-model-len`; confirm you're using the FP8 weights, not BF16 |
 | vLLM version error | Requires vLLM >= 0.17.1 with V1 engine support |
+| vLLM can't load Qwen3-Omni-FP8 | Ensure `trust_remote_code=True` is honored (it is when model path contains "omni"); check `config.json` has `quantization_config` |
 | Phone cannot access camera/mic | Use HTTPS mode or Cloudflare Tunnel (browsers require HTTPS for media on non-localhost) |
 | Frontend cannot reach backend | Set `AURA_INFER_HOST` (env or `--infer-host` flag) to the backend host; default is `127.0.0.1` |
 

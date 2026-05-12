@@ -34,7 +34,16 @@ class SessionHistory:
         self.max_context_qas = max_context_qas
         self.max_1qna_rounds = max_1qna_rounds
 
-        self.system_prompt = "You are receiving a live video stream where the final frame is the present moment. Respond only when a response is needed based on the user's message or the visual context. Otherwise, output '<|silent|>' to signify silence. Respond in Chinese."
+        self.system_prompt = (
+            "You are receiving a live video stream where the final frame is "
+            "the present moment, along with the user's voice. "
+            "When the user speaks, begin your response by wrapping your best "
+            "transcription of what they said in <query>...</query>, then "
+            "immediately produce your reply in Chinese. "
+            "If no response is needed (no user speech and nothing worth "
+            "commenting on in the visual context), output '<|silent|>' to "
+            "signify silence. Respond in Chinese."
+        )
         self._system_msg = {"role": "system", "content": self.system_prompt}
         self._context_history = []   # list of QAs; each QA = list of message dicts (text-only)
         self._sliding_window = []    # list of message dicts (may contain multimedia)
@@ -110,6 +119,8 @@ class SessionHistory:
                         serialized_content.append("<video>")
                     elif item_type == "image":
                         serialized_content.append("<image>")
+                    elif item_type == "audio":
+                        serialized_content.append("<audio>")
                     else:
                         serialized_content.append({"type": item_type})
                 entry["content"] = serialized_content
@@ -376,9 +387,10 @@ class SessionHistory:
               f"sliding_window={self.current_rounds} rounds, "
               f"total_messages={len(self.history)}")
 
-    def add_user_message(self, text: str, images: list = None, video_tuple: tuple = None):
+    def add_user_message(self, text: str, images: list = None,
+                         video_tuple: tuple = None, audio_tuple: tuple = None):
         """
-        Add user message with optional images or video.
+        Add user message with optional images, video, or audio.
 
         Args:
             text: User text message
@@ -386,6 +398,15 @@ class SessionHistory:
             video_tuple: Tuple of (numpy_array, metadata_dict) for video mode
                         numpy_array shape: (num_frames, height, width, 3)
                         metadata_dict: {"fps": float, "duration": float, "total_num_frames": int, ...}
+            audio_tuple: Tuple of (waveform, sample_rate) for end-to-end audio mode (Qwen3-Omni).
+                        waveform: float32 numpy array, mono
+                        sample_rate: int (typically 16000)
+
+        Note: audio entries are intended to be rewritten to plain text via
+        replace_last_user_audio_with_text() once the model has produced its
+        transcription (in the <query>...</query> prefix). Keeping audio
+        bytes in history beyond that point would defeat prefix caching and
+        blow the context budget.
         """
         content = []
 
@@ -394,9 +415,12 @@ class SessionHistory:
         elif images:
             content.extend([{"type": "image", "image": img} for img in images])
 
+        if audio_tuple:
+            content.append({"type": "audio", "audio": audio_tuple})
+
         if text:
             content.append({"type": "text", "text": text})
-        elif not images and not video_tuple:
+        elif not images and not video_tuple and not audio_tuple:
             return
 
         msg = {"role": "user", "content": content}
@@ -409,6 +433,60 @@ class SessionHistory:
             print(f"⚠️ Sliding window rounds ({self._sw_round_count()}) "
                   f"> max_rounds ({self.max_rounds}), pruning...")
             self._prune_history()
+
+    def replace_last_user_audio_with_text(self, transcription: str):
+        """Rewrite the most recent user message's audio entry into plain text.
+
+        Called by generate_response_with_video() once the model has emitted
+        the <query>...</query> prefix. After this call, the user message
+        contains only video + text (the transcription) — the raw waveform
+        is dropped from history.
+
+        Why: keeping the waveform would (a) re-feed the same audio on every
+        subsequent turn, defeating prefix caching, and (b) blow the context
+        budget since each second of audio costs many tokens.
+
+        No-op if the last user message has no audio entry (e.g. video-only
+        auto-generation, or already rewritten).
+        """
+        # Find the last user message (search from the end).
+        for msg in reversed(self._sliding_window):
+            if msg["role"] != "user":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                return  # text-only user message, nothing to rewrite
+            new_content = []
+            had_audio = False
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "audio":
+                    had_audio = True
+                    # Drop the audio entry; we'll add the transcription as
+                    # a text entry below if there isn't already one.
+                    continue
+                new_content.append(item)
+            if not had_audio:
+                return  # nothing to do
+            # Merge transcription into existing text item if present, else append.
+            existing_text_idx = next(
+                (i for i, it in enumerate(new_content)
+                 if isinstance(it, dict) and it.get("type") == "text"),
+                None,
+            )
+            if transcription:
+                if existing_text_idx is not None:
+                    # Prepend transcription to any existing text (transcription
+                    # is the "what the user said", explicit text would be a
+                    # follow-up — order: speech first, then any extras).
+                    existing = new_content[existing_text_idx].get("text", "")
+                    merged = (transcription + " " + existing).strip() if existing else transcription
+                    new_content[existing_text_idx] = {"type": "text", "text": merged}
+                else:
+                    new_content.append({"type": "text", "text": transcription})
+            msg["content"] = new_content
+            # `self.history` shares the dict objects, so the in-place mutation
+            # on `msg["content"]` is already visible. Nothing else to do.
+            return
 
     def add_assistant_message(self, text: str):
         """Add assistant response to history."""
@@ -425,6 +503,7 @@ class SessionHistory:
         full_prompt = ""
         all_images = []
         all_videos = []
+        all_audios = []
 
         for msg in self.history:
             role = msg["role"]
@@ -446,6 +525,10 @@ class SessionHistory:
                         # Qwen3-VL video tokens
                         full_prompt += "<|vision_start|><|video_pad|><|vision_end|>"
                         all_videos.append(item.get("video"))
+                    elif item.get("type") == "audio":
+                        # Qwen3-Omni audio tokens (E2E mode)
+                        full_prompt += "<|audio_start|><|audio_pad|><|audio_end|>"
+                        all_audios.append(item.get("audio"))
 
             full_prompt += "<|im_end|>"
 
@@ -458,6 +541,8 @@ class SessionHistory:
             multi_modal_data["image"] = all_images
         if all_videos:
             multi_modal_data["video"] = all_videos
+        if all_audios:
+            multi_modal_data["audio"] = all_audios
 
         return {
             "prompt": full_prompt,

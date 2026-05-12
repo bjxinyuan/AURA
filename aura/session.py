@@ -32,7 +32,12 @@ class StreamingSession:
 
     # Per-connection scratch state updated by the TCP handler as messages
     # arrive. accumulated_video_frames holds unpacked numpy arrays waiting
-    # for a generation trigger; last_prompt is the most recent ASR result
-    # not yet consumed by a video-triggered generation.
+    # for a generation trigger; last_prompt is the most recent typed/text
+    # prompt not yet consumed by a video-triggered generation;
+    # pending_audio is the most recent decoded audio waveform (waveform,
+    # sr) for Qwen3-Omni end-to-end mode — the inference loop feeds it
+    # to the model directly and extracts the transcription from the
+    # <query>...</query> prefix of the response.
     accumulated_video_frames: List[Any] = field(default_factory=list)
     last_prompt: str = ""
+    pending_audio: Optional[tuple] = None
